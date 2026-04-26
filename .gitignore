@@ -1,0 +1,32 @@
+# Build artifacts
+bin/
+obj/
+*.user
+.vs/
+*.suo
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+*.lock.json
+
+# Publish output
+publish/
+AppPackages/
+BundleArtifacts/
+
+# VS Code
+.vscode/
+
+# Rider
+.idea/
+
+# Test results
+TestResults/
+
+# Misc
+*.orig
+*.rej
+Thumbs.db
+Desktop.ini
