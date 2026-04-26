@@ -1,6 +1,6 @@
 # LightClock
 
-A lightweight, draggable desktop clock widget for Windows with a macOS-style design, built with **WinUI 3** (Windows App SDK).
+A lightweight, draggable desktop clock overlay for Windows with a transparent text-only style, built with **WinUI 3** (Windows App SDK).
 
 ![LightClock preview](docs/preview.png)
 
@@ -15,9 +15,9 @@ A lightweight, draggable desktop clock widget for Windows with a macOS-style des
 | 🔝 Always on Top | Floats above all other windows (toggleable) |
 | 🔎 HiDPI scaling | Per-monitor-v2 DPI awareness for sharp rendering on high-resolution displays |
 | 🔤 Font switching | Right-click menu lets you switch between Segoe UI Variable, Consolas, and Georgia |
-| 🌑 macOS dark-glass style | Frosted acrylic backdrop + dark charcoal overlay + rounded corners |
+| 🌌 Transparent overlay style | No panel background, only floating date/time text |
 | ⚙️ Settings via right-click | Toggle seconds, 24-hour format, always-on-top; or exit |
-| 📐 Compact footprint | ~330 × 148 px widget, sits in the bottom-right corner by default |
+| 📐 Wide layout | ~760 × 300 px, top-center by default |
 
 ---
 
@@ -64,6 +64,12 @@ Then run:
 .\publish\LightClock.exe
 ```
 
+### GitHub Actions (Windows 自动构建)
+
+仓库包含工作流：`.github/workflows/windows-build.yml`  
+可在 **Actions → Windows Build** 里手动触发，或在 push / PR 时自动触发。  
+构建成功后可下载产物：`LightClock-win-x64`。
+
 ---
 
 ## Usage
@@ -89,7 +95,7 @@ LightClock/
     ├── LightClock.csproj     Unpackaged WinUI 3 project (.NET 8)
     ├── app.manifest           DPI awareness + OS compatibility
     ├── App.xaml / .cs         Application entry point
-    ├── MainWindow.xaml        Clock UI (macOS-style dark-glass layout)
+    ├── MainWindow.xaml        Clock UI (transparent text-only layout)
     ├── MainWindow.xaml.cs     Clock logic, dragging, settings
     └── Assets/
         └── AppIcon.ico        Application icon
@@ -100,7 +106,7 @@ LightClock/
 ## Architecture Notes
 
 - **Unpackaged** (`WindowsPackageType=None`) — no MSIX required; runs directly from the output folder.
-- **DesktopAcrylicBackdrop** — the system-provided acrylic blur effect provides the "frosted glass" background; a semi-transparent dark `Border` (`#CC1C1C1E`) overlays it for the macOS dark-widget tint.
+- **Transparent overlay** — the window content is fully transparent; only date/time text is rendered.
 - **Dragging** — implemented via `ReleaseCapture()` + `SendMessage(WM_NCLBUTTONDOWN, HTCAPTION)` so the OS handles the move loop natively; right-click is not affected, so the XAML `ContextFlyout` works normally.
-- **Rounded corners** — on Windows 11, `DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)` enables DWM-level round corners; on Windows 10 the `Border.CornerRadius="18"` in XAML provides the rounded visual inside a square window.
+- **Placement** — the widget starts near the top-center of the primary display.
 - **Always on top** — `OverlappedPresenter.IsAlwaysOnTop = true` (default); user can toggle via the right-click menu.

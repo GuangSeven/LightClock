@@ -13,7 +13,7 @@ namespace LightClock;
 
 /// <summary>
 /// A lightweight, always-on-top, draggable desktop clock widget
-/// rendered in a macOS-style dark-glass panel with WinUI 3.
+/// rendered as transparent text-only overlay with WinUI 3.
 /// </summary>
 public sealed partial class MainWindow : Window
 {
@@ -24,14 +24,14 @@ public sealed partial class MainWindow : Window
     private DispatcherTimer _timer = null!;
     private IntPtr _hwnd;
 
-    private bool _use24Hour = false;
-    private bool _showSeconds = true;
+    private bool _use24Hour = true;
+    private bool _showSeconds = false;
     private bool _alwaysOnTop = true;
     private string _fontMode = "default";
 
     // Default widget dimensions (logical pixels at 100% DPI)
-    private const int WidgetWidth = 330;
-    private const int WidgetHeight = 148;
+    private const int WidgetWidth = 760;
+    private const int WidgetHeight = 300;
 
     // ── P/Invoke ─────────────────────────────────────────────────────────────
 
@@ -99,20 +99,16 @@ public sealed partial class MainWindow : Window
             _presenter.SetBorderAndTitleBar(false, false);
         }
 
-        // ── Windows 11: rounded window corners via DWM ────────────────────────
-        // DWMWCP_ROUND = 2 requests round corners; ignored on Windows 10.
+        // ── Keep default DWM corners for transparent text-only look.
         int roundCorners = DWMWCP_ROUND;
         DwmSetWindowAttribute(_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
                               ref roundCorners, sizeof(int));
 
-        // ── Acrylic system backdrop (blurs what is physically behind the window)
-        this.SystemBackdrop = new DesktopAcrylicBackdrop();
-
-        // ── Initial position: bottom-right of the primary work area ──────────
+        // ── Initial position: near top-center of the primary work area ───────
         var displayArea = DisplayArea.GetFromWindowId(windowId, DisplayAreaFallback.Primary);
         var workArea = displayArea.WorkArea;
-        int x = workArea.Width - WidgetWidth - 20;
-        int y = workArea.Height - WidgetHeight - 20;
+        int x = (workArea.Width - WidgetWidth) / 2;
+        int y = 40;
         _appWindow.Move(new PointInt32(Math.Max(0, x), Math.Max(0, y)));
 
         // ── Title (shown in Alt-Tab / taskbar thumbnail) ──────────────────────
@@ -191,7 +187,7 @@ public sealed partial class MainWindow : Window
         SecondsText.Visibility = _showSeconds ? Visibility.Visible : Visibility.Collapsed;
 
         // ── Date ─────────────────────────────────────────────────────────────
-        DateText.Text = now.ToString("dddd, MMMM d").ToUpper(System.Globalization.CultureInfo.CurrentCulture);
+        DateText.Text = now.ToString("dddd, MMMM d", System.Globalization.CultureInfo.CurrentCulture);
     }
 
     // ── Dragging ──────────────────────────────────────────────────────────────
