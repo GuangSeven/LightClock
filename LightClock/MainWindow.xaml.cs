@@ -9,7 +9,7 @@ using Microsoft.UI.Xaml.Media;
 using Windows.Graphics;
 using WinRT.Interop;
 
-namespace WidgetClock;
+namespace LightClock;
 
 /// <summary>
 /// A lightweight, always-on-top, draggable desktop clock widget
@@ -116,7 +116,7 @@ public sealed partial class MainWindow : Window
         _appWindow.Move(new PointInt32(Math.Max(0, x), Math.Max(0, y)));
 
         // ── Title (shown in Alt-Tab / taskbar thumbnail) ──────────────────────
-        _appWindow.Title = "WidgetClock";
+        _appWindow.Title = "LightClock";
 
         // ── Window icon (taskbar, Alt-Tab) ────────────────────────────────────
         var iconPath = Path.Combine(AppContext.BaseDirectory, "Assets", "AppIcon.ico");

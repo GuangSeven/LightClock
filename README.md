@@ -1,8 +1,8 @@
-# WidgetClock
+# LightClock
 
 A lightweight, draggable desktop clock widget for Windows with a macOS-style design, built with **WinUI 3** (Windows App SDK).
 
-![WidgetClock preview](docs/preview.png)
+![LightClock preview](docs/preview.png)
 
 ---
 
@@ -27,8 +27,7 @@ A lightweight, draggable desktop clock widget for Windows with a macOS-style des
 |-----------|----------------|
 | Windows | 10 version 1903 (build 18362) — Windows 11 gets rounded window corners |
 | .NET | 8 SDK |
-| Windows App SDK runtime | 1.5 (installed automatically with the app or via [installer](https://aka.ms/windowsappsdk/1.5/latest/windowsappsdk-x64.exe)) |
-| Visual Studio | 2022 17.8+ with the **Windows application development** workload |
+| Visual Studio | Optional (only needed if you prefer IDE debugging) |
 
 ---
 
@@ -36,7 +35,7 @@ A lightweight, draggable desktop clock widget for Windows with a macOS-style des
 
 ### Visual Studio
 
-1. Open `WidgetClock.sln`
+1. Open `LightClock.sln`
 2. Select **Debug | x64** (or Release)
 3. Press **F5**
 
@@ -44,18 +43,25 @@ A lightweight, draggable desktop clock widget for Windows with a macOS-style des
 
 ```powershell
 # Restore dependencies
-dotnet restore WidgetClock/WidgetClock.csproj
+dotnet restore LightClock/LightClock.csproj
 
 # Run (x64 debug)
-dotnet run --project WidgetClock/WidgetClock.csproj -r win-x64
+dotnet run --project LightClock/LightClock.csproj -r win-x64
 ```
 
-### Self-contained publish (single folder, no runtime install needed)
+### Self-contained publish (single folder, no Visual Studio / runtime dependency)
 
 ```powershell
-dotnet publish WidgetClock/WidgetClock.csproj `
+dotnet publish LightClock/LightClock.csproj `
     -c Release -r win-x64 --self-contained true `
+    -p:WindowsAppSDKSelfContained=true `
     -o publish/
+```
+
+Then run:
+
+```powershell
+.\publish\LightClock.exe
 ```
 
 ---
@@ -77,10 +83,10 @@ dotnet publish WidgetClock/WidgetClock.csproj `
 ## Project Structure
 
 ```
-WidgetClock/
-├── WidgetClock.sln            Visual Studio solution
-└── WidgetClock/
-    ├── WidgetClock.csproj     Unpackaged WinUI 3 project (.NET 8)
+LightClock/
+├── LightClock.sln            Visual Studio solution
+└── LightClock/
+    ├── LightClock.csproj     Unpackaged WinUI 3 project (.NET 8)
     ├── app.manifest           DPI awareness + OS compatibility
     ├── App.xaml / .cs         Application entry point
     ├── MainWindow.xaml        Clock UI (macOS-style dark-glass layout)

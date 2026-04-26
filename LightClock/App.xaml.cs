@@ -1,9 +1,9 @@
 using Microsoft.UI.Xaml;
 
-namespace WidgetClock;
+namespace LightClock;
 
 /// <summary>
-/// Entry point for the WidgetClock application.
+/// Entry point for the LightClock application.
 /// </summary>
 public partial class App : Application
 {
