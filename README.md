@@ -13,6 +13,8 @@ A lightweight, draggable desktop clock widget for Windows with a macOS-style des
 | 🕐 Live clock | Updates every second |
 | 🖱️ Draggable | Left-click and drag anywhere on the widget |
 | 🔝 Always on Top | Floats above all other windows (toggleable) |
+| 🔎 HiDPI scaling | Per-monitor-v2 DPI awareness for sharp rendering on high-resolution displays |
+| 🔤 Font switching | Right-click menu lets you switch between Segoe UI Variable, Consolas, and Georgia |
 | 🌑 macOS dark-glass style | Frosted acrylic backdrop + dark charcoal overlay + rounded corners |
 | ⚙️ Settings via right-click | Toggle seconds, 24-hour format, always-on-top; or exit |
 | 📐 Compact footprint | ~330 × 148 px widget, sits in the bottom-right corner by default |
@@ -67,6 +69,7 @@ dotnet publish WidgetClock/WidgetClock.csproj `
 | **Always on Top** (menu) | Toggle whether the widget floats above all windows |
 | **Show Seconds** (menu) | Show/hide the seconds counter |
 | **24-Hour Format** (menu) | Switch between 12-hour (AM/PM) and 24-hour display |
+| **Font** (menu) | Switch clock font style (Segoe UI Variable / Consolas / Georgia) |
 | **Exit** (menu) | Close the application |
 
 ---
@@ -95,4 +98,3 @@ WidgetClock/
 - **Dragging** — implemented via `ReleaseCapture()` + `SendMessage(WM_NCLBUTTONDOWN, HTCAPTION)` so the OS handles the move loop natively; right-click is not affected, so the XAML `ContextFlyout` works normally.
 - **Rounded corners** — on Windows 11, `DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)` enables DWM-level round corners; on Windows 10 the `Border.CornerRadius="18"` in XAML provides the rounded visual inside a square window.
 - **Always on top** — `OverlappedPresenter.IsAlwaysOnTop = true` (default); user can toggle via the right-click menu.
-

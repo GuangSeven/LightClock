@@ -27,6 +27,7 @@ public sealed partial class MainWindow : Window
     private bool _use24Hour = false;
     private bool _showSeconds = true;
     private bool _alwaysOnTop = true;
+    private string _fontMode = "default";
 
     // Default widget dimensions (logical pixels at 100% DPI)
     private const int WidgetWidth = 330;
@@ -137,7 +138,35 @@ public sealed partial class MainWindow : Window
         _timer.Start();
 
         // Draw immediately so the widget looks correct before the first tick.
+        ApplyFontSelection();
         UpdateClock();
+    }
+
+    private void ApplyFontSelection()
+    {
+        string displayFont;
+        string uiFont;
+
+        switch (_fontMode)
+        {
+            case "mono":
+                displayFont = "Consolas";
+                uiFont = "Consolas";
+                break;
+            case "serif":
+                displayFont = "Georgia";
+                uiFont = "Georgia";
+                break;
+            default:
+                displayFont = "Segoe UI Variable Display";
+                uiFont = "Segoe UI Variable";
+                break;
+        }
+
+        TimeText.FontFamily = new FontFamily(displayFont);
+        AmPmText.FontFamily = new FontFamily(uiFont);
+        SecondsText.FontFamily = new FontFamily(uiFont);
+        DateText.FontFamily = new FontFamily(uiFont);
     }
 
     private void UpdateClock()
@@ -211,6 +240,17 @@ public sealed partial class MainWindow : Window
             _use24Hour = item.IsChecked;
             UpdateClock();
         }
+    }
+
+    private void FontOption_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not RadioMenuFlyoutItem item || item.Tag is not string mode)
+        {
+            return;
+        }
+
+        _fontMode = mode;
+        ApplyFontSelection();
     }
 
     private void Exit_Click(object sender, RoutedEventArgs e)

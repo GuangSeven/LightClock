@@ -30,6 +30,24 @@
                                       Text="24-Hour Format"
                                       IsChecked="False"
                                       Click="Use24Hour_Click"/>
+                <MenuFlyoutSubItem Text="Font">
+                    <RadioMenuFlyoutItem x:Name="FontDefaultItem"
+                                         GroupName="ClockFont"
+                                         Text="Segoe UI Variable"
+                                         IsChecked="True"
+                                         Click="FontOption_Click"
+                                         Tag="default"/>
+                    <RadioMenuFlyoutItem x:Name="FontMonoItem"
+                                         GroupName="ClockFont"
+                                         Text="Consolas"
+                                         Click="FontOption_Click"
+                                         Tag="mono"/>
+                    <RadioMenuFlyoutItem x:Name="FontSerifItem"
+                                         GroupName="ClockFont"
+                                         Text="Georgia"
+                                         Click="FontOption_Click"
+                                         Tag="serif"/>
+                </MenuFlyoutSubItem>
                 <MenuFlyoutSeparator/>
                 <MenuFlyoutItem Text="Exit" Click="Exit_Click">
                     <MenuFlyoutItem.Icon>
