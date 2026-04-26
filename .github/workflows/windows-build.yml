@@ -38,7 +38,6 @@ jobs:
           -r win-x64
           --self-contained true
           -p:Platform=x64
-          -p:WindowsAppSDKSelfContained=true
           -o .\publish
           --no-build
 

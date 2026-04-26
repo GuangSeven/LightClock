@@ -13,18 +13,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>12</LangVersion>
-    <UseWinUI>true</UseWinUI>
-    <WindowsPackageType>None</WindowsPackageType>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
     <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
   </PropertyGroup>
-
-  <ItemGroup>
-    <!-- Windows App SDK – provides WinUI 3, AppWindow, SystemBackdrop, etc. -->
-    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.5.240607001" />
-    <!-- Build tools for Windows SDK projections (code-gen; private asset, not deployed) -->
-    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.22621.756" PrivateAssets="All" />
-  </ItemGroup>
 
   <ItemGroup>
     <Content Include="Assets\AppIcon.ico">
