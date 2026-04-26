@@ -24,11 +24,11 @@
                                       Click="AlwaysOnTop_Click"/>
                 <ToggleMenuFlyoutItem x:Name="ShowSecondsItem"
                                       Text="Show Seconds"
-                                      IsChecked="True"
+                                      IsChecked="False"
                                       Click="ShowSeconds_Click"/>
                 <ToggleMenuFlyoutItem x:Name="Use24HourItem"
                                       Text="24-Hour Format"
-                                      IsChecked="False"
+                                      IsChecked="True"
                                       Click="Use24Hour_Click"/>
                 <MenuFlyoutSubItem Text="Font">
                     <RadioMenuFlyoutItem x:Name="FontDefaultItem"

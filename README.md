@@ -64,11 +64,11 @@ Then run:
 .\publish\LightClock.exe
 ```
 
-### GitHub Actions (Windows 自动构建)
+### GitHub Actions (Windows automated build)
 
-仓库包含工作流：`.github/workflows/windows-build.yml`  
-可在 **Actions → Windows Build** 里手动触发，或在 push / PR 时自动触发。  
-构建成功后可下载产物：`LightClock-win-x64`。
+This repository includes workflow `.github/workflows/windows-build.yml`.  
+You can trigger it manually from **Actions → Windows Build**, or let it run automatically on push / PR.  
+After success, download artifact: `LightClock-win-x64`.
 
 ---
 
