@@ -198,7 +198,11 @@ internal static class Program
 
     private static void Paint(IntPtr hwnd)
     {
-        BeginPaint(hwnd, out var ps);
+        var hdc = BeginPaint(hwnd, out var ps);
+        if (hdc == IntPtr.Zero)
+        {
+            return;
+        }
         try
         {
             GetClientRect(hwnd, out var rect);
@@ -407,7 +411,7 @@ internal static class Program
     private static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool BeginPaint(IntPtr hWnd, out PaintStruct lpPaint);
+    private static extern IntPtr BeginPaint(IntPtr hWnd, out PaintStruct lpPaint);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool EndPaint(IntPtr hWnd, [In] ref PaintStruct lpPaint);
