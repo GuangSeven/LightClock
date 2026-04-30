@@ -31,6 +31,10 @@ internal static class Program
     private const uint MfChecked = 0x00000008;
     private const uint MfUnchecked = 0x00000000;
 
+    private const uint DtCenter = 0x00000001;
+    private const uint DtVCenter = 0x00000004;
+    private const uint DtSingleLine = 0x00000020;
+
     private const int CmdToggleTopMost = 1001;
     private const int CmdExit = 1002;
 
@@ -226,7 +230,7 @@ internal static class Program
                 top = rect.top + 18,
                 bottom = rect.top + 120
             };
-            DrawText(ps.hdc, _dateText, _dateText.Length, ref dateRect, 0x00000001 | 0x00000004 | 0x00000020);
+            DrawText(ps.hdc, _dateText, _dateText.Length, ref dateRect, DtCenter | DtVCenter | DtSingleLine);
 
             SelectObject(ps.hdc, timeFont.Handle);
             var timeRect = new Rect
@@ -236,7 +240,7 @@ internal static class Program
                 top = rect.top + 92,
                 bottom = rect.bottom
             };
-            DrawText(ps.hdc, _timeText, _timeText.Length, ref timeRect, 0x00000001 | 0x00000004 | 0x00000020);
+            DrawText(ps.hdc, _timeText, _timeText.Length, ref timeRect, DtCenter | DtVCenter | DtSingleLine);
             SelectObject(ps.hdc, oldFont);
         }
         finally
