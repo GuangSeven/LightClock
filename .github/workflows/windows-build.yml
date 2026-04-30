@@ -1,0 +1,48 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+      - copilot/**
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore
+        run: dotnet restore .\LightClock\LightClock.csproj
+
+      - name: Build (Release x64)
+        run: dotnet build .\LightClock\LightClock.csproj -c Release -p:Platform=x64 --no-restore
+
+      - name: Publish self-contained (win-x64)
+        run: >
+          dotnet publish .\LightClock\LightClock.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:Platform=x64
+          -o .\publish
+          --no-build
+
+      - name: Upload publish artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LightClock-win-x64
+          path: .\publish\**
