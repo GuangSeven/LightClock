@@ -21,6 +21,12 @@ internal static class Program
     private const uint WsExToolWindow = 0x00000080;
     private const uint WsExLayered = 0x00080000;
 
+    private const uint ImageIcon = 1;
+    private const uint LrLoadFromFile = 0x00000010;
+    private const int IdcArrow = 32512;
+    private const uint SpiGetWorkArea = 0x0030;
+    private const uint TpmReturnCmd = 0x0100;
+
     private const int SwpNomove = 0x0002;
     private const int SwpNosize = 0x0001;
     private const int SwpShowWindow = 0x0040;
@@ -75,7 +81,7 @@ internal static class Program
         IntPtr hIcon = IntPtr.Zero;
         if (File.Exists(iconPath))
         {
-            hIcon = LoadImage(IntPtr.Zero, iconPath, 1, 0, 0, 0x00000010);
+            hIcon = LoadImage(IntPtr.Zero, iconPath, ImageIcon, 0, 0, LrLoadFromFile);
         }
 
         var wndClass = new WndClassEx
@@ -87,7 +93,7 @@ internal static class Program
             cbWndExtra = 0,
             hInstance = hInstance,
             hIcon = hIcon,
-            hCursor = LoadCursor(IntPtr.Zero, (IntPtr)32512),
+            hCursor = LoadCursor(IntPtr.Zero, (IntPtr)IdcArrow),
             hbrBackground = IntPtr.Zero,
             lpszMenuName = null,
             lpszClassName = WindowClassName,
@@ -102,7 +108,7 @@ internal static class Program
         var x = 0;
         var y = 0;
         var workArea = new Rect();
-        if (SystemParametersInfo(0x0030, 0, ref workArea, 0))
+        if (SystemParametersInfo(SpiGetWorkArea, 0, ref workArea, 0))
         {
             x = workArea.left + Math.Max(0, ((workArea.right - workArea.left) - WindowWidth) / 2);
             y = workArea.top + 40;
@@ -265,7 +271,7 @@ internal static class Program
 
             GetCursorPos(out var point);
             SetForegroundWindow(hwnd);
-            TrackPopupMenu(menu, 0x0100, point.x, point.y, 0, hwnd, IntPtr.Zero);
+            TrackPopupMenu(menu, TpmReturnCmd, point.x, point.y, 0, hwnd, IntPtr.Zero);
         }
         finally
         {
