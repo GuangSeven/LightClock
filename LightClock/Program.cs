@@ -56,8 +56,16 @@ internal static class Program
     private const int WmRButtonUp = 0x0205;
     private const int WmNCRButtonUp = 0x00A5;
     private const int WmNCHitTest = 0x0084;
+    private const int WmDpiChanged = 0x02E0;
+    private const int WmDisplayChange = 0x007E;
 
     private const int HtCaption = 2;
+
+    private const uint DefaultCharset = 1;   // DEFAULT_CHARSET - lets GDI pick the best charset for the current locale
+    private const uint OutTtPrecis = 0x04;   // OUT_TT_PRECIS - prefer TrueType
+    private const uint ClipDefaultPrecis = 0x00;
+    private const uint ProofQuality = 0x02;  // PROOF_QUALITY - smooth edges
+    private const uint PitchAndFamilySwiss = 0x22;  // VARIABLE_PITCH (0x02) | FF_SWISS (0x20) — matches Segoe UI's category
 
     private static readonly IntPtr HwndTopmost = new(-1);
     private static readonly IntPtr HwndNotTopmost = new(-2);
@@ -74,6 +82,13 @@ internal static class Program
     // Cached GDI fonts (created once, reused across paints). Avoids leaking GDI handles by recreating fonts every timer tick.
     private static IntPtr _dateFontHandle = IntPtr.Zero;
     private static IntPtr _timeFontHandle = IntPtr.Zero;
+
+    // Loaded icon handle. Tracked so we can free it on exit instead of leaking it.
+    private static IntPtr _hIcon = IntPtr.Zero;
+    private static int _dpi = 96;
+
+    private const int DpiDateFontHeight = 56;
+    private const int DpiTimeFontHeight = 168;
 
     [STAThread]
     private static void Main()
@@ -101,6 +116,12 @@ internal static class Program
                 DeleteObject(_timeFontHandle);
                 _timeFontHandle = IntPtr.Zero;
             }
+            // Free the loaded icon (LoadImage created it; the window class holds a reference too).
+            if (_hIcon != IntPtr.Zero)
+            {
+                DestroyIcon(_hIcon);
+                _hIcon = IntPtr.Zero;
+            }
         }
     }
 
@@ -111,6 +132,7 @@ internal static class Program
         if (File.Exists(iconPath))
         {
             hIcon = LoadImage(IntPtr.Zero, iconPath, ImageIcon, 0, 0, LrLoadFromFile);
+            _hIcon = hIcon;
         }
 
         var wndClass = new WndClassEx
@@ -225,6 +247,27 @@ internal static class Program
             case WmEraseBkgnd:
                 return (IntPtr)1;
 
+            case WmDpiChanged:
+                // wParam = new DPI (HIWORD = y dpi, LOWORD = x dpi). lParam = suggested rect.
+                int newDpi = (int)(((ulong)(long)wParam >> 16) & 0xFFFF);
+                if (newDpi > 0 && newDpi != _dpi)
+                {
+                    _dpi = newDpi;
+                    // Drop cached fonts so they get recreated at the new DPI on the next paint.
+                    if (_dateFontHandle != IntPtr.Zero)
+                    {
+                        DeleteObject(_dateFontHandle);
+                        _dateFontHandle = IntPtr.Zero;
+                    }
+                    if (_timeFontHandle != IntPtr.Zero)
+                    {
+                        DeleteObject(_timeFontHandle);
+                        _timeFontHandle = IntPtr.Zero;
+                    }
+                    InvalidateRect(hwnd, IntPtr.Zero, true);
+                }
+                return IntPtr.Zero;
+
             case WmNCHitTest:
                 return (IntPtr)HtCaption;
 
@@ -255,11 +298,14 @@ internal static class Program
             SetTextColor(ps.hdc, TextColor);
 
             // Lazily create fonts once and reuse them across paints to avoid leaking GDI handles.
+            // Scale by current DPI so the clock stays readable when dragged between monitors with different DPI.
+            int dateHeight = MulDiv(DpiDateFontHeight, _dpi, 96);
+            int timeHeight = MulDiv(DpiTimeFontHeight, _dpi, 96);
             _dateFontHandle = _dateFontHandle == IntPtr.Zero
-                ? CreateFont(56, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 4, 0, "Segoe UI")
+                ? CreateFont(dateHeight, 0, 0, 0, 400, 0, 0, 0, DefaultCharset, OutTtPrecis, ClipDefaultPrecis, ProofQuality, PitchAndFamilySwiss, "Segoe UI")
                 : _dateFontHandle;
             _timeFontHandle = _timeFontHandle == IntPtr.Zero
-                ? CreateFont(168, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 4, 0, "Segoe UI")
+                ? CreateFont(timeHeight, 0, 0, 0, 600, 0, 0, 0, DefaultCharset, OutTtPrecis, ClipDefaultPrecis, ProofQuality, PitchAndFamilySwiss, "Segoe UI")
                 : _timeFontHandle;
 
             IntPtr oldFont = SelectObject(ps.hdc, _dateFontHandle);
@@ -335,6 +381,9 @@ internal static class Program
     }
 
     private static int LowWord(IntPtr value) => (int)((uint)(long)value & 0xFFFF);
+
+    private static int MulDiv(int nNumber, int nNumerator, int nDenominator)
+        => (int)(((long)nNumber * nNumerator) / nDenominator);
 
     private static uint Rgb(byte r, byte g, byte b) => (uint)(r | (g << 8) | (b << 16));
 
@@ -541,4 +590,7 @@ internal static class Program
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref Rect pvParam, uint fWinIni);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool DestroyIcon(IntPtr hIcon);
 }

@@ -1,9 +1,21 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <!--
+      TargetFramework is net8.0-windows (not net8.0-windows10.0.19041.0) because
+      LightClock uses only Win32 + GDI via P/Invoke. The -windows10.0.x TFM would
+      implicitly pull in the Windows SDK .NET runtimepack (WinRT.Runtime.dll +
+      Microsoft.Windows.SDK.NET.dll), which:
+        1. Bloats the framework-dependent publish with two extra ~25 MB DLLs.
+        2. Causes misleading ".NET runtime missing" errors when users install
+           only the .NET Desktop Runtime, because deps.json references a
+           runtimepack that isn't part of the global .NET runtime install.
+      Removing the SDK version suffix keeps the same OS target (Windows) while
+      dropping the unnecessary WinRT dependency. The app.manifest still declares
+      Windows 10/11 compatibility for the OS loader.
+    -->
+    <TargetFramework>net8.0-windows</TargetFramework>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
-    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
     <RootNamespace>LightClock</RootNamespace>
     <AssemblyName>LightClock</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>
