@@ -25,6 +25,8 @@ internal static class Program
     private const uint LrLoadFromFile = 0x00000010;
     private const int IdcArrow = 32512;
     private const uint SpiGetWorkArea = 0x0030;
+    private const uint TpmLeftAlign = 0x0000;
+    private const uint TpmRightButton = 0x0002;
     private const uint TpmReturnCmd = 0x0100;
 
     private const int SwpNomove = 0x0002;
@@ -52,6 +54,7 @@ internal static class Program
     private const int WmTimer = 0x0113;
     private const int WmEraseBkgnd = 0x0014;
     private const int WmRButtonUp = 0x0205;
+    private const int WmNCRButtonUp = 0x00A5;
     private const int WmNCHitTest = 0x0084;
 
     private const int HtCaption = 2;
@@ -68,6 +71,10 @@ internal static class Program
     private static string _dateText = string.Empty;
     private static string _timeText = string.Empty;
 
+    // Cached GDI fonts (created once, reused across paints). Avoids leaking GDI handles by recreating fonts every timer tick.
+    private static IntPtr _dateFontHandle = IntPtr.Zero;
+    private static IntPtr _timeFontHandle = IntPtr.Zero;
+
     [STAThread]
     private static void Main()
     {
@@ -77,6 +84,28 @@ internal static class Program
             return;
         }
 
+        try
+        {
+            Run(hInstance);
+        }
+        finally
+        {
+            // Free cached GDI fonts on exit.
+            if (_dateFontHandle != IntPtr.Zero)
+            {
+                DeleteObject(_dateFontHandle);
+                _dateFontHandle = IntPtr.Zero;
+            }
+            if (_timeFontHandle != IntPtr.Zero)
+            {
+                DeleteObject(_timeFontHandle);
+                _timeFontHandle = IntPtr.Zero;
+            }
+        }
+    }
+
+    private static void Run(IntPtr hInstance)
+    {
         var iconPath = Path.Combine(AppContext.BaseDirectory, "Assets", "AppIcon.ico");
         IntPtr hIcon = IntPtr.Zero;
         if (File.Exists(iconPath))
@@ -164,6 +193,8 @@ internal static class Program
                 return IntPtr.Zero;
 
             case WmRButtonUp:
+            case WmNCRButtonUp:
+                // WM_NCHITTEST always returns HTCAPTION, so right-clicks arrive as WM_NCRBUTTONUP rather than WM_RBUTTONUP. Handle both.
                 ShowContextMenu(hwnd);
                 return IntPtr.Zero;
 
@@ -223,12 +254,15 @@ internal static class Program
             SetBkMode(ps.hdc, 1);
             SetTextColor(ps.hdc, TextColor);
 
-            using var dateFont = new GdiObject(CreateFont(
-                56, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 4, 0, "Segoe UI"));
-            using var timeFont = new GdiObject(CreateFont(
-                168, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 4, 0, "Segoe UI"));
+            // Lazily create fonts once and reuse them across paints to avoid leaking GDI handles.
+            _dateFontHandle = _dateFontHandle == IntPtr.Zero
+                ? CreateFont(56, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 4, 0, "Segoe UI")
+                : _dateFontHandle;
+            _timeFontHandle = _timeFontHandle == IntPtr.Zero
+                ? CreateFont(168, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 4, 0, "Segoe UI")
+                : _timeFontHandle;
 
-            IntPtr oldFont = SelectObject(ps.hdc, dateFont.Handle);
+            IntPtr oldFont = SelectObject(ps.hdc, _dateFontHandle);
             var dateRect = new Rect
             {
                 left = rect.left,
@@ -238,7 +272,7 @@ internal static class Program
             };
             DrawText(ps.hdc, _dateText, _dateText.Length, ref dateRect, DtCenter | DtVCenter | DtSingleLine);
 
-            SelectObject(ps.hdc, timeFont.Handle);
+            SelectObject(ps.hdc, _timeFontHandle);
             var timeRect = new Rect
             {
                 left = rect.left,
@@ -271,7 +305,21 @@ internal static class Program
 
             GetCursorPos(out var point);
             SetForegroundWindow(hwnd);
-            TrackPopupMenu(menu, TpmReturnCmd, point.x, point.y, 0, hwnd, IntPtr.Zero);
+            // TPM_RETURNCMD makes TrackPopupMenu return the selected item ID instead of posting WM_COMMAND.
+            // Capture the return value and dispatch the command explicitly so menu items actually work.
+            int chosen = TrackPopupMenuRaw(
+                menu,
+                TpmLeftAlign | TpmRightButton | TpmReturnCmd,
+                point.x,
+                point.y,
+                0,
+                hwnd,
+                IntPtr.Zero);
+
+            if (chosen != 0)
+            {
+                PostMessage(hwnd, WmCommand, (IntPtr)chosen, IntPtr.Zero);
+            }
         }
         finally
         {
@@ -286,7 +334,7 @@ internal static class Program
         _timeText = now.ToString("HH:mm");
     }
 
-    private static int LowWord(IntPtr value) => (short)((long)value & 0xFFFF);
+    private static int LowWord(IntPtr value) => (int)((uint)(long)value & 0xFFFF);
 
     private static uint Rgb(byte r, byte g, byte b) => (uint)(r | (g << 8) | (b << 16));
 
@@ -476,8 +524,8 @@ internal static class Program
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool DestroyMenu(IntPtr hMenu);
 
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool TrackPopupMenu(IntPtr hMenu, uint uFlags, int x, int y, int nReserved, IntPtr hWnd, IntPtr prcRect);
+    [DllImport("user32.dll", SetLastError = true, EntryPoint = "TrackPopupMenu")]
+    private static extern int TrackPopupMenuRaw(IntPtr hMenu, uint uFlags, int x, int y, int nReserved, IntPtr hWnd, IntPtr prcRect);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetCursorPos(out Point lpPoint);
