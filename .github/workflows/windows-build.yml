@@ -40,10 +40,26 @@ jobs:
       - name: Restore (${{ matrix.rid }})
         run: dotnet restore .\LightClock\LightClock.csproj -r ${{ matrix.rid }}
 
-      - name: Build (Release ${{ matrix.rid }})
-        run: dotnet build .\LightClock\LightClock.csproj -c Release -r ${{ matrix.rid }} -p:Platform=${{ matrix.platform }} --no-restore
-
       - name: Publish self-contained (${{ matrix.rid }})
+        # IMPORTANT: do NOT pass --no-build here.
+        #
+        # The .NET SDK generates the runtimeconfig.json differently for `build` vs `publish`:
+        #   - `dotnet build` produces a framework-dependent runtimeconfig.json that references
+        #     "framework": { "name": "Microsoft.NETCore.App", "version": "8.0.0" }.
+        #   - `dotnet publish --self-contained` produces a self-contained runtimeconfig.json
+        #     with "includedFrameworks": [{ "name": "Microsoft.NETCore.App", "version": "8.0.28" }]
+        #     and includes coreclr.dll / System.Private.CoreLib.dll in the output.
+        #
+        # If publish is run with --no-build, it SKIPS the runtimeconfig.json regeneration
+        # step and just copies the framework-dependent version produced by `build`. The
+        # resulting artifact then has coreclr.dll bundled (so it LOOKS self-contained) but
+        # the runtimeconfig.json still declares a global framework reference to
+        # Microsoft.NETCore.App 8.0.0 — which causes hostfx to fail with the misleading
+        # "You must install or update .NET to run this application" error on machines that
+        # don't have the .NET 8 runtime installed.
+        #
+        # Letting publish run its own build step ensures the runtimeconfig.json is
+        # regenerated correctly for the self-contained scenario.
         run: >
           dotnet publish .\LightClock\LightClock.csproj
           -c Release
@@ -51,7 +67,6 @@ jobs:
           --self-contained true
           -p:Platform=${{ matrix.platform }}
           -o .\publish-${{ matrix.rid }}
-          --no-build
 
       - name: Upload publish artifact (${{ matrix.rid }})
         uses: actions/upload-artifact@v7
