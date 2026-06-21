@@ -34,6 +34,14 @@ internal static class Program
     private const int SwpShowWindow = 0x0040;
 
     private const uint LwaColorKey = 0x00000001;
+    private const uint LwaAlpha = 0x00000002;
+    private const byte InitialAlpha = 255;
+    private const uint UlwAlpha = 0x00000002;
+    private const byte AcSrcOver = 0;
+    private const byte AcSrcAlpha = 1;
+    private const uint DibRgbColors = 0;
+    private const uint BiRgb = 0;
+    private const int BitsPixel = 32;
     private const uint MfString = 0x00000000;
     private const uint MfSeparator = 0x00000800;
     private const uint MfChecked = 0x00000008;
@@ -42,6 +50,8 @@ internal static class Program
     private const uint DtCenter = 0x00000001;
     private const uint DtVCenter = 0x00000004;
     private const uint DtSingleLine = 0x00000020;
+    private const int TransparentBkMode = 1;  // TRANSPARENT — don't fill text background
+    private const int OpaqueBkMode = 2;       // OPAQUE — fill text background with current background color
 
     private const int CmdToggleTopMost = 1001;
     private const int CmdExit = 1002;
@@ -66,11 +76,11 @@ internal static class Program
     private const uint ClipDefaultPrecis = 0x00;
     private const uint ProofQuality = 0x02;  // PROOF_QUALITY - smooth edges
     private const uint PitchAndFamilySwiss = 0x22;  // VARIABLE_PITCH (0x02) | FF_SWISS (0x20) — matches Segoe UI's category
+    private const uint PitchAndFamilyModern = 0x31;  // FIXED_PITCH (0x01) | FF_MODERN (0x30) — used for monospaced time font
 
     private static readonly IntPtr HwndTopmost = new(-1);
     private static readonly IntPtr HwndNotTopmost = new(-2);
 
-    private static readonly uint TransparentColor = Rgb(0, 0, 0);
     private static readonly uint TextColor = Rgb(195, 236, 244);
 
     private static readonly WndProcDelegate WndProcRef = WndProc;
@@ -86,6 +96,15 @@ internal static class Program
     // Loaded icon handle. Tracked so we can free it on exit instead of leaking it.
     private static IntPtr _hIcon = IntPtr.Zero;
     private static int _dpi = 96;
+
+    // Cached 32-bit ARGB DIB section + its DC + old bitmap, used for per-pixel-alpha rendering.
+    // Recreated only when window size or DPI changes.
+    private static IntPtr _memDc = IntPtr.Zero;
+    private static IntPtr _dib = IntPtr.Zero;
+    private static IntPtr _oldDib = IntPtr.Zero;
+    private static int _dibWidth;
+    private static int _dibHeight;
+    private static byte[]? _dibBitsBacking;
 
     private const int DpiDateFontHeight = 56;
     private const int DpiTimeFontHeight = 168;
@@ -122,6 +141,8 @@ internal static class Program
                 DestroyIcon(_hIcon);
                 _hIcon = IntPtr.Zero;
             }
+            // Free the per-pixel-alpha DIB section.
+            FreeDib();
         }
     }
 
@@ -184,11 +205,17 @@ internal static class Program
             return;
         }
 
-        SetLayeredWindowAttributes(hwnd, TransparentColor, 255, LwaColorKey);
+        // Use per-pixel alpha (UpdateLayeredWindow) instead of color-key transparency.
+        // Color-key (LwaColorKey) produces a visible dark fringe around anti-aliased glyphs because
+        // the blended edge pixels don't match the key exactly and remain visible. Per-pixel alpha
+        // gives each pixel its own alpha value, so anti-aliased edges blend correctly with whatever
+        // is behind the window.
+        //
+        // We do NOT call SetLayeredWindowAttributes here — that would override UpdateLayeredWindow.
         SetWindowPos(hwnd, HwndTopmost, 0, 0, 0, 0, SwpNomove | SwpNosize | SwpShowWindow);
 
         UpdateClockText();
-        InvalidateRect(hwnd, IntPtr.Zero, true);
+        RenderAndPresent(hwnd);
 
         Msg msg;
         while (GetMessage(out msg, IntPtr.Zero, 0, 0))
@@ -210,7 +237,10 @@ internal static class Program
                 if (wParam == (IntPtr)TimerId)
                 {
                     UpdateClockText();
-                    InvalidateRect(hwnd, IntPtr.Zero, true);
+                    // Re-render the per-pixel-alpha bitmap and present it via UpdateLayeredWindow.
+                    // We do NOT use InvalidateRect + WM_PAINT because layered windows with
+                    // UpdateLayeredWindow bypass the normal paint pipeline.
+                    RenderAndPresent(hwnd);
                 }
                 return IntPtr.Zero;
 
@@ -264,7 +294,9 @@ internal static class Program
                         DeleteObject(_timeFontHandle);
                         _timeFontHandle = IntPtr.Zero;
                     }
-                    InvalidateRect(hwnd, IntPtr.Zero, true);
+                    // Free the DIB so it gets recreated at the new size.
+                    FreeDib();
+                    RenderAndPresent(hwnd);
                 }
                 return IntPtr.Zero;
 
@@ -282,57 +314,232 @@ internal static class Program
 
     private static void Paint(IntPtr hwnd)
     {
+        // Layered windows using UpdateLayeredWindow don't go through WM_PAINT — we render
+        // directly into a 32-bit DIB and call UpdateLayeredWindow in RenderAndPresent.
+        // But Windows may still send WM_PAINT (e.g. when the window is uncovered); validate
+        // the region so we don't get spurious repaints.
         var hdc = BeginPaint(hwnd, out var ps);
-        if (hdc == IntPtr.Zero)
+        if (hdc != IntPtr.Zero)
+        {
+            EndPaint(hwnd, ref ps);
+        }
+    }
+
+    /// <summary>
+    /// Renders the clock into a 32-bit ARGB DIB and presents it via UpdateLayeredWindow.
+    /// This is the per-pixel-alpha path that eliminates the dark fringe around anti-aliased
+    /// text glyphs that color-key transparency (LwaColorKey) produced.
+    /// </summary>
+    private static void RenderAndPresent(IntPtr hwnd)
+    {
+        GetClientRect(hwnd, out var rect);
+        int width = rect.right - rect.left;
+        int height = rect.bottom - rect.top;
+        if (width <= 0 || height <= 0)
+        {
+            return;
+        }
+
+        EnsureDib(width, height);
+        if (_memDc == IntPtr.Zero || _dib == IntPtr.Zero)
+        {
+            return;
+        }
+
+        // Clear the DIB to fully transparent (all zero).
+        // 32-bit ARGB DIB layout is BGRA, 4 bytes per pixel, premultiplied alpha.
+        // For fully transparent black (0,0,0,0), the bytes are all 0.
+        if (_dibBitsBacking != null)
+        {
+            Array.Clear(_dibBitsBacking, 0, _dibBitsBacking.Length);
+        }
+
+        // Lazily create fonts once and reuse them across paints to avoid leaking GDI handles.
+        // Scale by current DPI so the clock stays readable when dragged between monitors with different DPI.
+        int dateHeight = MulDiv(DpiDateFontHeight, _dpi, 96);
+        int timeHeight = MulDiv(DpiTimeFontHeight, _dpi, 96);
+        _dateFontHandle = _dateFontHandle == IntPtr.Zero
+            ? CreateFont(dateHeight, 0, 0, 0, 400, 0, 0, 0, DefaultCharset, OutTtPrecis, ClipDefaultPrecis, ProofQuality, PitchAndFamilySwiss, "Segoe UI")
+            : _dateFontHandle;
+        // Time font uses Consolas (monospaced) so each digit takes the same width.
+        // With Segoe UI (proportional), "1" is narrower than "8" — when the minute changes
+        // from e.g. 11:58 to 11:59, the text width shifts and DT_CENTER re-centers it,
+        // causing a visible horizontal "jump". A monospaced font eliminates this entirely.
+        _timeFontHandle = _timeFontHandle == IntPtr.Zero
+            ? CreateFont(timeHeight, 0, 0, 0, 600, 0, 0, 0, DefaultCharset, OutTtPrecis, ClipDefaultPrecis, ProofQuality, PitchAndFamilyModern, "Consolas")
+            : _timeFontHandle;
+
+        // Set up the memory DC for text rendering.
+        // Note: GDI text rendering on a 32-bit DIB produces straight-alpha (non-premultiplied)
+        // pixels by default. For UpdateLayeredWindow with AC_SRC_ALPHA, the bitmap must be
+        // premultiplied. We use SetTextColor + SetBkMode(TRANSPARENT) and then post-process
+        // the DIB bits to convert from straight to premultiplied alpha.
+        SetBkMode(_memDc, TransparentBkMode);
+        SetTextColor(_memDc, TextColor);
+
+        IntPtr oldFont = SelectObject(_memDc, _dateFontHandle);
+        var dateRect = new Rect
+        {
+            left = rect.left,
+            right = rect.right,
+            top = rect.top + 18,
+            bottom = rect.top + 120
+        };
+        DrawText(_memDc, _dateText, _dateText.Length, ref dateRect, DtCenter | DtVCenter | DtSingleLine);
+
+        SelectObject(_memDc, _timeFontHandle);
+        var timeRect = new Rect
+        {
+            left = rect.left,
+            right = rect.right,
+            top = rect.top + 92,
+            bottom = rect.bottom
+        };
+        DrawText(_memDc, _timeText, _timeText.Length, ref timeRect, DtCenter | DtVCenter | DtSingleLine);
+        SelectObject(_memDc, oldFont);
+
+        // Convert straight-alpha to premultiplied-alpha in-place.
+        // GDI leaves the DIB with: B, G, R, A where A is the alpha from text anti-aliasing
+        // (0 where background, 255 where glyph interior, intermediate at edges).
+        // We need premultiplied: B*A/255, G*A/255, R*A/255, A.
+        if (_dibBitsBacking != null)
+        {
+            for (int i = 0; i < _dibBitsBacking.Length; i += 4)
+            {
+                byte b = _dibBitsBacking[i];
+                byte g = _dibBitsBacking[i + 1];
+                byte r = _dibBitsBacking[i + 2];
+                byte a = _dibBitsBacking[i + 3];
+                if (a == 0)
+                {
+                    _dibBitsBacking[i] = 0;
+                    _dibBitsBacking[i + 1] = 0;
+                    _dibBitsBacking[i + 2] = 0;
+                }
+                else if (a < 255)
+                {
+                    _dibBitsBacking[i] = (byte)((b * a) / 255);
+                    _dibBitsBacking[i + 1] = (byte)((g * a) / 255);
+                    _dibBitsBacking[i + 2] = (byte)((r * a) / 255);
+                }
+                // a stays the same
+            }
+        }
+
+        // Present via UpdateLayeredWindow with per-pixel alpha.
+        var blend = new BlendFunction
+        {
+            BlendOp = AcSrcOver,
+            BlendFlags = 0,
+            SourceConstantAlpha = InitialAlpha,
+            AlphaFormat = AcSrcAlpha
+        };
+        var zeroPt = new Point { x = 0, y = 0 };
+        var size = new Size { cx = width, cy = height };
+        UpdateLayeredWindow(
+            hwnd,
+            IntPtr.Zero,        // hdcDst - screen DC (NULL = default)
+            IntPtr.Zero,        // pptDst - NULL = keep current position
+            ref size,           // psize - new window size
+            _memDc,             // hdcSrc - source DC
+            ref zeroPt,         // pptSrc - source origin
+            0,                  // crKey - color key (unused with ULW_ALPHA)
+            ref blend,
+            UlwAlpha);
+    }
+
+    /// <summary>
+    /// Ensures we have a 32-bit ARGB DIB section of the given size for per-pixel-alpha rendering.
+    /// Reuses the existing DIB if the size hasn't changed.
+    /// </summary>
+    private static void EnsureDib(int width, int height)
+    {
+        if (_dib != IntPtr.Zero && _dibWidth == width && _dibHeight == height)
+        {
+            return;
+        }
+
+        FreeDib();
+
+        // Create a compatible memory DC.
+        IntPtr screenDc = GetDC(IntPtr.Zero);
+        if (screenDc == IntPtr.Zero)
         {
             return;
         }
         try
         {
-            GetClientRect(hwnd, out var rect);
-
-            using var bgBrush = new GdiObject(CreateSolidBrush(TransparentColor));
-            FillRect(ps.hdc, ref rect, bgBrush.Handle);
-
-            SetBkMode(ps.hdc, 1);
-            SetTextColor(ps.hdc, TextColor);
-
-            // Lazily create fonts once and reuse them across paints to avoid leaking GDI handles.
-            // Scale by current DPI so the clock stays readable when dragged between monitors with different DPI.
-            int dateHeight = MulDiv(DpiDateFontHeight, _dpi, 96);
-            int timeHeight = MulDiv(DpiTimeFontHeight, _dpi, 96);
-            _dateFontHandle = _dateFontHandle == IntPtr.Zero
-                ? CreateFont(dateHeight, 0, 0, 0, 400, 0, 0, 0, DefaultCharset, OutTtPrecis, ClipDefaultPrecis, ProofQuality, PitchAndFamilySwiss, "Segoe UI")
-                : _dateFontHandle;
-            _timeFontHandle = _timeFontHandle == IntPtr.Zero
-                ? CreateFont(timeHeight, 0, 0, 0, 600, 0, 0, 0, DefaultCharset, OutTtPrecis, ClipDefaultPrecis, ProofQuality, PitchAndFamilySwiss, "Segoe UI")
-                : _timeFontHandle;
-
-            IntPtr oldFont = SelectObject(ps.hdc, _dateFontHandle);
-            var dateRect = new Rect
+            _memDc = CreateCompatibleDC(screenDc);
+            if (_memDc == IntPtr.Zero)
             {
-                left = rect.left,
-                right = rect.right,
-                top = rect.top + 18,
-                bottom = rect.top + 120
-            };
-            DrawText(ps.hdc, _dateText, _dateText.Length, ref dateRect, DtCenter | DtVCenter | DtSingleLine);
+                return;
+            }
 
-            SelectObject(ps.hdc, _timeFontHandle);
-            var timeRect = new Rect
+            var bmi = new BitmapInfo
             {
-                left = rect.left,
-                right = rect.right,
-                top = rect.top + 92,
-                bottom = rect.bottom
+                bmiHeader = new BitmapInfoHeader
+                {
+                    biSize = (uint)Marshal.SizeOf<BitmapInfoHeader>(),
+                    biWidth = width,
+                    biHeight = -height,  // negative = top-down DIB (so row 0 is at the top)
+                    biPlanes = 1,
+                    biBitCount = (ushort)BitsPixel,
+                    biCompression = BiRgb,
+                    biSizeImage = (uint)(width * height * 4),
+                    biXPelsPerMeter = 0,
+                    biYPelsPerMeter = 0,
+                    biClrUsed = 0,
+                    biClrImportant = 0
+                }
             };
-            DrawText(ps.hdc, _timeText, _timeText.Length, ref timeRect, DtCenter | DtVCenter | DtSingleLine);
-            SelectObject(ps.hdc, oldFont);
+
+            _dib = CreateDIBSection(screenDc, ref bmi, DibRgbColors, out IntPtr bits, IntPtr.Zero, 0);
+            if (_dib == IntPtr.Zero)
+            {
+                DeleteDC(_memDc);
+                _memDc = IntPtr.Zero;
+                return;
+            }
+
+            _oldDib = SelectObject(_memDc, _dib);
+
+            // Create a managed byte[] view over the DIB bits so we can clear and post-process them.
+            int byteCount = width * height * 4;
+            _dibBitsBacking = new byte[byteCount];
+            Marshal.Copy(bits, _dibBitsBacking, 0, byteCount);
+
+            _dibWidth = width;
+            _dibHeight = height;
         }
         finally
         {
-            EndPaint(hwnd, ref ps);
+            ReleaseDC(IntPtr.Zero, screenDc);
         }
+    }
+
+    /// <summary>
+    /// Frees the cached DIB section and its memory DC.
+    /// </summary>
+    private static void FreeDib()
+    {
+        if (_memDc != IntPtr.Zero)
+        {
+            if (_oldDib != IntPtr.Zero)
+            {
+                SelectObject(_memDc, _oldDib);
+                _oldDib = IntPtr.Zero;
+            }
+            DeleteDC(_memDc);
+            _memDc = IntPtr.Zero;
+        }
+        if (_dib != IntPtr.Zero)
+        {
+            DeleteObject(_dib);
+            _dib = IntPtr.Zero;
+        }
+        _dibWidth = 0;
+        _dibHeight = 0;
+        _dibBitsBacking = null;
     }
 
     private static void ShowContextMenu(IntPtr hwnd)
@@ -423,6 +630,13 @@ internal static class Program
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    private struct Size
+    {
+        public int cx;
+        public int cy;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct Rect
     {
         public int left;
@@ -441,6 +655,38 @@ internal static class Program
         public int fIncUpdate;
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
         public byte[] rgbReserved;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BitmapInfoHeader
+    {
+        public uint biSize;
+        public int biWidth;
+        public int biHeight;
+        public ushort biPlanes;
+        public ushort biBitCount;
+        public uint biCompression;
+        public uint biSizeImage;
+        public int biXPelsPerMeter;
+        public int biYPelsPerMeter;
+        public uint biClrUsed;
+        public uint biClrImportant;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BitmapInfo
+    {
+        public BitmapInfoHeader bmiHeader;
+        // No color table for 32-bit DIB.
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BlendFunction
+    {
+        public byte BlendOp;
+        public byte BlendFlags;
+        public byte SourceConstantAlpha;
+        public byte AlphaFormat;
     }
 
     private sealed class GdiObject : IDisposable
@@ -498,6 +744,18 @@ internal static class Program
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint crKey, byte bAlpha, uint dwFlags);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool UpdateLayeredWindow(
+        IntPtr hwnd,
+        IntPtr hdcDst,
+        IntPtr pptDst,
+        ref Size psize,
+        IntPtr hdcSrc,
+        ref Point pptSrc,
+        uint crKey,
+        ref BlendFunction pblend,
+        uint dwFlags);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, int uFlags);
@@ -593,4 +851,19 @@ internal static class Program
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool DestroyIcon(IntPtr hIcon);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr GetDC(IntPtr hWnd);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+
+    [DllImport("gdi32.dll", SetLastError = true)]
+    private static extern IntPtr CreateCompatibleDC(IntPtr hDC);
+
+    [DllImport("gdi32.dll", SetLastError = true)]
+    private static extern bool DeleteDC(IntPtr hdc);
+
+    [DllImport("gdi32.dll", SetLastError = true)]
+    private static extern IntPtr CreateDIBSection(IntPtr hdc, ref BitmapInfo pbmi, uint usage, out IntPtr ppvBits, IntPtr hSection, uint dwOffset);
 }
