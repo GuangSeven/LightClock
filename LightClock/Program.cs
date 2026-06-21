@@ -63,6 +63,7 @@ internal static class Program
     private const int CmdFontConsolas = 1011;
     private const int CmdFontCascadiaCode = 1012;
     private const int CmdFontMicrosoftYaHei = 1013;
+    private const int CmdToggleAutoStart = 1020;
 
     private const int WmCreate = 0x0001;
     private const int WmDestroy = 0x0002;
@@ -103,6 +104,13 @@ internal static class Program
     private static string _timeFontName = "Consolas";
     private static uint _timeFontPitchAndFamily = PitchAndFamilyModern;  // matches Consolas by default
 
+    // Whether to launch LightClock at Windows startup (HKCU Run key).
+    private static bool _autoStart = false;
+
+    // Path to the persistent settings file: %APPDATA%/LightClock/settings.json
+    // Lazily computed because Environment.GetFolderPath isn't available on all targets.
+    private static string? _settingsPath;
+
     private static string _dateText = string.Empty;
     private static string _timeText = string.Empty;
 
@@ -134,6 +142,10 @@ internal static class Program
         {
             return;
         }
+
+        // Load persisted settings before creating the window so the first render uses the
+        // user's preferred language/font/etc. instead of the defaults.
+        LoadSettings();
 
         try
         {
@@ -292,6 +304,7 @@ internal static class Program
                         _language = "en";
                         UpdateClockText();
                         RenderAndPresent(hwnd);
+                        SaveSettings();
                     }
                 }
                 else if (commandId == CmdLanguageZh)
@@ -301,6 +314,7 @@ internal static class Program
                         _language = "zh";
                         UpdateClockText();
                         RenderAndPresent(hwnd);
+                        SaveSettings();
                     }
                 }
                 else if (commandId == CmdFontSegoUi || commandId == CmdFontConsolas ||
@@ -325,7 +339,14 @@ internal static class Program
                             _timeFontHandle = IntPtr.Zero;
                         }
                         RenderAndPresent(hwnd);
+                        SaveSettings();
                     }
+                }
+                else if (commandId == CmdToggleAutoStart)
+                {
+                    _autoStart = !_autoStart;
+                    SetAutoStart(_autoStart);
+                    SaveSettings();
                 }
                 return IntPtr.Zero;
 
@@ -645,6 +666,9 @@ internal static class Program
             AppendMenu(fontMenu, MfString | (_timeFontName == "Microsoft YaHei" ? MfChecked : MfUnchecked), CmdFontMicrosoftYaHei, "Microsoft YaHei");
             AppendMenu(menu, MfString | 0x0010 /* MF_POPUP */, (uint)fontMenu.ToInt64(), "Font");
 
+            // Start with Windows (toggle)
+            AppendMenu(menu, MfString | (_autoStart ? MfChecked : MfUnchecked), CmdToggleAutoStart, "Start with Windows");
+
             // Exit
             AppendMenu(menu, MfSeparator, 0, null);
             AppendMenu(menu, MfString, CmdExit, "Exit");
@@ -705,6 +729,120 @@ internal static class Program
         => (int)(((long)nNumber * nNumerator) / nDenominator);
 
     private static uint Rgb(byte r, byte g, byte b) => (uint)(r | (g << 8) | (b << 16));
+
+    // ---- Settings persistence (settings.json in %APPDATA%/LightClock/) ----
+
+    private static string GetSettingsPath()
+    {
+        if (_settingsPath != null) return _settingsPath;
+        string baseDir = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        string dir = Path.Combine(baseDir, "LightClock");
+        Directory.CreateDirectory(dir);
+        _settingsPath = Path.Combine(dir, "settings.json");
+        return _settingsPath;
+    }
+
+    private static void LoadSettings()
+    {
+        try
+        {
+            string path = GetSettingsPath();
+            if (!File.Exists(path)) return;
+            string json = File.ReadAllText(path);
+            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (root.TryGetProperty("language", out var langEl) && langEl.ValueKind == System.Text.Json.JsonValueKind.String)
+            {
+                string lang = langEl.GetString() ?? "en";
+                if (lang == "en" || lang == "zh") _language = lang;
+            }
+            if (root.TryGetProperty("timeFont", out var fontEl) && fontEl.ValueKind == System.Text.Json.JsonValueKind.String)
+            {
+                string font = fontEl.GetString() ?? "Consolas";
+                switch (font)
+                {
+                    case "Segoe UI": _timeFontName = font; _timeFontPitchAndFamily = PitchAndFamilySwiss; break;
+                    case "Consolas": _timeFontName = font; _timeFontPitchAndFamily = PitchAndFamilyModern; break;
+                    case "Cascadia Code": _timeFontName = font; _timeFontPitchAndFamily = PitchAndFamilyModern; break;
+                    case "Microsoft YaHei": _timeFontName = font; _timeFontPitchAndFamily = PitchAndFamilySwiss; break;
+                }
+            }
+            if (root.TryGetProperty("autoStart", out var autoEl) && autoEl.ValueKind == System.Text.Json.JsonValueKind.True)
+            {
+                _autoStart = true;
+            }
+            // Sync the registry entry with the loaded preference. If the user previously enabled
+            // auto-start from the menu but later removed the entry manually (or via Task Manager),
+            // we re-create it so the menu checkmark stays consistent with reality.
+            if (_autoStart) SetAutoStart(true);
+        }
+        catch
+        {
+            // Corrupt settings file — silently fall back to defaults.
+        }
+    }
+
+    private static void SaveSettings()
+    {
+        try
+        {
+            string path = GetSettingsPath();
+            var obj = new Dictionary<string, object>
+            {
+                ["language"] = _language,
+                ["timeFont"] = _timeFontName,
+                ["autoStart"] = _autoStart
+            };
+            string json = System.Text.Json.JsonSerializer.Serialize(obj, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(path, json);
+        }
+        catch
+        {
+            // Settings are best-effort — ignore write failures (e.g. read-only AppData).
+        }
+    }
+
+    // ---- Auto-start via HKCU\Software\Microsoft\Windows\CurrentVersion\Run ----
+
+    private const string AutoStartRegistryKey = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    private const string AutoStartValueName = "LightClock";
+    private static readonly IntPtr HkeyCurrentUser = new IntPtr(unchecked((long)0x80000001));
+
+    private static void SetAutoStart(bool enable)
+    {
+        try
+        {
+            int result = RegOpenKeyEx(HkeyCurrentUser, AutoStartRegistryKey, 0, 0x000F003F /* KEY_ALL_ACCESS */, out IntPtr hKey);
+            if (result != 0) return;
+            try
+            {
+                if (enable)
+                {
+                    // Quote the path in case it contains spaces. Use the .exe (not .dll) so Windows
+                    // launches the native host instead of the dotnet runtime host.
+                    // Environment.ProcessPath returns the full path to the currently-executing .exe.
+                    string? exePath = Environment.ProcessPath;
+                    if (!string.IsNullOrEmpty(exePath))
+                    {
+                        string value = "\"" + exePath + "\"";
+                        RegSetValueEx(hKey, AutoStartValueName, 0, 1 /* REG_SZ */, value);
+                    }
+                }
+                else
+                {
+                    RegDeleteValue(hKey, AutoStartValueName);
+                }
+            }
+            finally
+            {
+                RegCloseKey(hKey);
+            }
+        }
+        catch
+        {
+            // Auto-start is best-effort — ignore registry failures.
+        }
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct WndClassEx
@@ -975,6 +1113,18 @@ internal static class Program
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool DestroyIcon(IntPtr hIcon);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int RegOpenKeyEx(IntPtr hKey, string lpSubKey, uint ulOptions, int samDesired, out IntPtr phkResult);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "RegSetValueExW")]
+    private static extern int RegSetValueEx(IntPtr hKey, string lpValueName, uint reserved, uint dwType, string lpData);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int RegDeleteValue(IntPtr hKey, string lpValueName);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern int RegCloseKey(IntPtr hKey);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr GetDC(IntPtr hWnd);
