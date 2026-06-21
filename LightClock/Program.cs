@@ -32,6 +32,8 @@ internal static class Program
     private const int SwpNomove = 0x0002;
     private const int SwpNosize = 0x0001;
     private const int SwpShowWindow = 0x0040;
+    private const int SwpHideWindow = 0x0080;
+    private const int SwpNoactivate = 0x0010;
 
     private const uint LwaColorKey = 0x00000001;
     private const uint LwaAlpha = 0x00000002;
@@ -55,6 +57,12 @@ internal static class Program
 
     private const int CmdToggleTopMost = 1001;
     private const int CmdExit = 1002;
+    private const int CmdLanguageEn = 1003;
+    private const int CmdLanguageZh = 1004;
+    private const int CmdFontSegoUi = 1010;
+    private const int CmdFontConsolas = 1011;
+    private const int CmdFontCascadiaCode = 1012;
+    private const int CmdFontMicrosoftYaHei = 1013;
 
     private const int WmCreate = 0x0001;
     private const int WmDestroy = 0x0002;
@@ -68,6 +76,7 @@ internal static class Program
     private const int WmNCHitTest = 0x0084;
     private const int WmDpiChanged = 0x02E0;
     private const int WmDisplayChange = 0x007E;
+    private const int WmWindowPosChanging = 0x0046;
 
     private const int HtCaption = 2;
 
@@ -85,6 +94,14 @@ internal static class Program
 
     private static readonly WndProcDelegate WndProcRef = WndProc;
     private static bool _alwaysOnTop = true;
+
+    // Current display language: 'en' or 'zh'. Affects date format and day/month names.
+    private static string _language = "en";
+
+    // Current time font name. Default is Consolas (monospaced). User can switch to other fonts
+    // via the right-click menu. Selected name is stored as a literal Win32 font face name.
+    private static string _timeFontName = "Consolas";
+    private static uint _timeFontPitchAndFamily = PitchAndFamilyModern;  // matches Consolas by default
 
     private static string _dateText = string.Empty;
     private static string _timeText = string.Empty;
@@ -268,6 +285,48 @@ internal static class Program
                 {
                     PostMessage(hwnd, WmClose, IntPtr.Zero, IntPtr.Zero);
                 }
+                else if (commandId == CmdLanguageEn)
+                {
+                    if (_language != "en")
+                    {
+                        _language = "en";
+                        UpdateClockText();
+                        RenderAndPresent(hwnd);
+                    }
+                }
+                else if (commandId == CmdLanguageZh)
+                {
+                    if (_language != "zh")
+                    {
+                        _language = "zh";
+                        UpdateClockText();
+                        RenderAndPresent(hwnd);
+                    }
+                }
+                else if (commandId == CmdFontSegoUi || commandId == CmdFontConsolas ||
+                         commandId == CmdFontCascadiaCode || commandId == CmdFontMicrosoftYaHei)
+                {
+                    // Drop cached time font so it gets recreated with the new face name on next render.
+                    var (name, pitch) = commandId switch
+                    {
+                        CmdFontSegoUi => ("Segoe UI", PitchAndFamilySwiss),
+                        CmdFontConsolas => ("Consolas", PitchAndFamilyModern),
+                        CmdFontCascadiaCode => ("Cascadia Code", PitchAndFamilyModern),
+                        CmdFontMicrosoftYaHei => ("Microsoft YaHei", PitchAndFamilySwiss),
+                        _ => (_timeFontName, _timeFontPitchAndFamily)
+                    };
+                    if (_timeFontName != name)
+                    {
+                        _timeFontName = name;
+                        _timeFontPitchAndFamily = pitch;
+                        if (_timeFontHandle != IntPtr.Zero)
+                        {
+                            DeleteObject(_timeFontHandle);
+                            _timeFontHandle = IntPtr.Zero;
+                        }
+                        RenderAndPresent(hwnd);
+                    }
+                }
                 return IntPtr.Zero;
 
             case WmPaint:
@@ -302,6 +361,23 @@ internal static class Program
 
             case WmNCHitTest:
                 return (IntPtr)HtCaption;
+
+            case WmWindowPosChanging:
+                // Win+D (Show Desktop) hides all top-level windows by sending WM_WINDOWPOSCHANGING
+                // with the SWP_HIDEWINDOW flag. We strip that flag here so the clock stays visible
+                // when the user presses Win+D. This also blocks programmatic minimize-all commands
+                // from hiding the clock while still allowing normal minimize via the taskbar (which
+                // this window doesn't have, being a WS_EX_TOOLWINDOW).
+                if (wParam != IntPtr.Zero)
+                {
+                    var wp = Marshal.PtrToStructure<WindowPos>(wParam);
+                    if ((wp.flags & SwpHideWindow) != 0)
+                    {
+                        wp.flags &= ~(uint)SwpHideWindow;
+                        Marshal.StructureToPtr(wp, wParam, fDeleteOld: false);
+                    }
+                }
+                return IntPtr.Zero;
 
             case WmDestroy:
                 KillTimer(hwnd, TimerId);
@@ -366,7 +442,7 @@ internal static class Program
         // from e.g. 11:58 to 11:59, the text width shifts and DT_CENTER re-centers it,
         // causing a visible horizontal "jump". A monospaced font eliminates this entirely.
         _timeFontHandle = _timeFontHandle == IntPtr.Zero
-            ? CreateFont(timeHeight, 0, 0, 0, 600, 0, 0, 0, DefaultCharset, OutTtPrecis, ClipDefaultPrecis, ProofQuality, PitchAndFamilyModern, "Consolas")
+            ? CreateFont(timeHeight, 0, 0, 0, 600, 0, 0, 0, DefaultCharset, OutTtPrecis, ClipDefaultPrecis, ProofQuality, _timeFontPitchAndFamily, _timeFontName)
             : _timeFontHandle;
 
         // Set up the memory DC for text rendering.
@@ -552,7 +628,24 @@ internal static class Program
 
         try
         {
+            // Always on Top (toggle)
             AppendMenu(menu, MfString | (_alwaysOnTop ? MfChecked : MfUnchecked), CmdToggleTopMost, "Always on Top");
+
+            // Language submenu
+            IntPtr langMenu = CreatePopupMenu();
+            AppendMenu(langMenu, MfString | (_language == "en" ? MfChecked : MfUnchecked), CmdLanguageEn, "English");
+            AppendMenu(langMenu, MfString | (_language == "zh" ? MfChecked : MfUnchecked), CmdLanguageZh, "中文 (Chinese)");
+            AppendMenu(menu, MfString | 0x0010 /* MF_POPUP */, (uint)langMenu.ToInt64(), "Language");
+
+            // Font submenu (affects time display only; date always uses Segoe UI for proportional look)
+            IntPtr fontMenu = CreatePopupMenu();
+            AppendMenu(fontMenu, MfString | (_timeFontName == "Segoe UI" ? MfChecked : MfUnchecked), CmdFontSegoUi, "Segoe UI");
+            AppendMenu(fontMenu, MfString | (_timeFontName == "Consolas" ? MfChecked : MfUnchecked), CmdFontConsolas, "Consolas");
+            AppendMenu(fontMenu, MfString | (_timeFontName == "Cascadia Code" ? MfChecked : MfUnchecked), CmdFontCascadiaCode, "Cascadia Code");
+            AppendMenu(fontMenu, MfString | (_timeFontName == "Microsoft YaHei" ? MfChecked : MfUnchecked), CmdFontMicrosoftYaHei, "Microsoft YaHei");
+            AppendMenu(menu, MfString | 0x0010 /* MF_POPUP */, (uint)fontMenu.ToInt64(), "Font");
+
+            // Exit
             AppendMenu(menu, MfSeparator, 0, null);
             AppendMenu(menu, MfString, CmdExit, "Exit");
 
@@ -583,8 +676,27 @@ internal static class Program
     private static void UpdateClockText()
     {
         var now = DateTime.Now;
-        _dateText = now.ToString("dddd, MMMM d");
-        _timeText = now.ToString("HH:mm");
+        if (_language == "zh")
+        {
+            // Chinese: use the system's zh-CN culture if available, otherwise fall back to invariant.
+            try
+            {
+                var ci = new System.Globalization.CultureInfo("zh-CN");
+                _dateText = now.ToString("M月d日 dddd", ci);
+                _timeText = now.ToString("HH:mm", ci);
+            }
+            catch
+            {
+                // CultureInfo not available — fall back to English.
+                _dateText = now.ToString("dddd, MMMM d");
+                _timeText = now.ToString("HH:mm");
+            }
+        }
+        else
+        {
+            _dateText = now.ToString("dddd, MMMM d");
+            _timeText = now.ToString("HH:mm");
+        }
     }
 
     private static int LowWord(IntPtr value) => (int)((uint)(long)value & 0xFFFF);
@@ -687,6 +799,18 @@ internal static class Program
         public byte BlendFlags;
         public byte SourceConstantAlpha;
         public byte AlphaFormat;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WindowPos
+    {
+        public IntPtr hwnd;
+        public IntPtr hwndInsertAfter;
+        public int x;
+        public int y;
+        public int cx;
+        public int cy;
+        public uint flags;
     }
 
     private sealed class GdiObject : IDisposable
