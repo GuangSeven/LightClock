@@ -85,6 +85,8 @@ internal static class Program
     private const uint OutTtPrecis = 0x04;   // OUT_TT_PRECIS - prefer TrueType
     private const uint ClipDefaultPrecis = 0x00;
     private const uint ProofQuality = 0x02;  // PROOF_QUALITY - smooth edges
+    private const uint AntialiasedQuality = 0x04;  // ANTIALIASED_QUALITY - smooth edges (more compatible than PROOF_QUALITY for some fonts)
+    private const uint CleartypeQuality = 0x05;  // CLEARTYPE_QUALITY - best for LCD
     private const uint PitchAndFamilySwiss = 0x22;  // VARIABLE_PITCH (0x02) | FF_SWISS (0x20) — matches Segoe UI's category
     private const uint PitchAndFamilyModern = 0x31;  // FIXED_PITCH (0x01) | FF_MODERN (0x30) — used for monospaced time font
 
@@ -129,6 +131,12 @@ internal static class Program
     private static IntPtr _oldDib = IntPtr.Zero;
     private static int _dibWidth;
     private static int _dibHeight;
+    // IMPORTANT: _dibBits is the RAW POINTER to the DIB section's pixel memory. We must zero
+    // this memory directly before each render (not a C# byte[] copy), because GDI's DrawText
+    // writes to this same memory. The previous implementation kept a byte[] copy and cleared
+    // that copy instead, leaving the real DIB memory untouched — so successive paints stacked
+    // on top of each other (digits never cleared → overlap bug).
+    private static IntPtr _dibBits = IntPtr.Zero;
     private static byte[]? _dibBitsBacking;
 
     private const int DpiDateFontHeight = 56;
@@ -389,6 +397,13 @@ internal static class Program
                 // when the user presses Win+D. This also blocks programmatic minimize-all commands
                 // from hiding the clock while still allowing normal minimize via the taskbar (which
                 // this window doesn't have, being a WS_EX_TOOLWINDOW).
+                //
+                // IMPORTANT: after editing the WINDOWPOS struct, we must fall through to
+                // DefWindowProc so other position changes (move, resize, Z-order) are applied
+                // normally. Previously we returned IntPtr.Zero here, which swallowed ALL
+                // position changes including Z-order → the 'Always on Top' toggle (which uses
+                // HWND_TOPMOST/HWND_NOTOPMOST via SetWindowPos) had no effect, so the clock
+                // was permanently stuck on top.
                 if (wParam != IntPtr.Zero)
                 {
                     var wp = Marshal.PtrToStructure<WindowPos>(wParam);
@@ -398,7 +413,7 @@ internal static class Program
                         Marshal.StructureToPtr(wp, wParam, fDeleteOld: false);
                     }
                 }
-                return IntPtr.Zero;
+                break;  // fall through to DefWindowProc
 
             case WmDestroy:
                 KillTimer(hwnd, TimerId);
@@ -438,32 +453,30 @@ internal static class Program
         }
 
         EnsureDib(width, height);
-        if (_memDc == IntPtr.Zero || _dib == IntPtr.Zero)
+        if (_memDc == IntPtr.Zero || _dib == IntPtr.Zero || _dibBits == IntPtr.Zero)
         {
             return;
         }
 
-        // Clear the DIB to fully transparent (all zero).
-        // 32-bit ARGB DIB layout is BGRA, 4 bytes per pixel, premultiplied alpha.
-        // For fully transparent black (0,0,0,0), the bytes are all 0.
-        if (_dibBitsBacking != null)
-        {
-            Array.Clear(_dibBitsBacking, 0, _dibBitsBacking.Length);
-        }
+        // Clear the REAL DIB pixel memory to fully transparent (all zero).
+        // This must touch the DIB's own memory (via _dibBits pointer), NOT a byte[] copy.
+        // If we only cleared a copy, the next DrawText would stack on top of the previous
+        // frame's glyphs → digits would never disappear, causing the overlap bug.
+        RtlZeroMemory(_dibBits, (nuint)(width * height * 4));
 
         // Lazily create fonts once and reuse them across paints to avoid leaking GDI handles.
         // Scale by current DPI so the clock stays readable when dragged between monitors with different DPI.
         int dateHeight = MulDiv(DpiDateFontHeight, _dpi, 96);
         int timeHeight = MulDiv(DpiTimeFontHeight, _dpi, 96);
         _dateFontHandle = _dateFontHandle == IntPtr.Zero
-            ? CreateFont(dateHeight, 0, 0, 0, 400, 0, 0, 0, DefaultCharset, OutTtPrecis, ClipDefaultPrecis, ProofQuality, PitchAndFamilySwiss, "Segoe UI")
+            ? CreateFont(dateHeight, 0, 0, 0, 400, 0, 0, 0, DefaultCharset, OutTtPrecis, ClipDefaultPrecis, CleartypeQuality, PitchAndFamilySwiss, "Segoe UI")
             : _dateFontHandle;
         // Time font uses Consolas (monospaced) so each digit takes the same width.
         // With Segoe UI (proportional), "1" is narrower than "8" — when the minute changes
         // from e.g. 11:58 to 11:59, the text width shifts and DT_CENTER re-centers it,
         // causing a visible horizontal "jump". A monospaced font eliminates this entirely.
         _timeFontHandle = _timeFontHandle == IntPtr.Zero
-            ? CreateFont(timeHeight, 0, 0, 0, 600, 0, 0, 0, DefaultCharset, OutTtPrecis, ClipDefaultPrecis, ProofQuality, _timeFontPitchAndFamily, _timeFontName)
+            ? CreateFont(timeHeight, 0, 0, 0, 600, 0, 0, 0, DefaultCharset, OutTtPrecis, ClipDefaultPrecis, CleartypeQuality, _timeFontPitchAndFamily, _timeFontName)
             : _timeFontHandle;
 
         // Set up the memory DC for text rendering.
@@ -495,33 +508,44 @@ internal static class Program
         DrawText(_memDc, _timeText, _timeText.Length, ref timeRect, DtCenter | DtVCenter | DtSingleLine);
         SelectObject(_memDc, oldFont);
 
-        // Convert straight-alpha to premultiplied-alpha in-place.
+        // Copy the CURRENT DIB pixel data (post-DrawText) into our managed buffer so we can
+        // post-process it. This is a READ from DIB memory, NOT a write to it. After processing
+        // (straight→premultiplied alpha), we Marshal.Copy back into the DIB so UpdateLayeredWindow
+        // sees the premultiplied pixels.
+        int byteCount = width * height * 4;
+        if (_dibBitsBacking == null || _dibBitsBacking.Length != byteCount)
+        {
+            _dibBitsBacking = new byte[byteCount];
+        }
+        Marshal.Copy(_dibBits, _dibBitsBacking, 0, byteCount);
+
+        // Convert straight-alpha to premultiplied-alpha in-place in the managed buffer.
         // GDI leaves the DIB with: B, G, R, A where A is the alpha from text anti-aliasing
         // (0 where background, 255 where glyph interior, intermediate at edges).
         // We need premultiplied: B*A/255, G*A/255, R*A/255, A.
-        if (_dibBitsBacking != null)
+        for (int i = 0; i < _dibBitsBacking.Length; i += 4)
         {
-            for (int i = 0; i < _dibBitsBacking.Length; i += 4)
+            byte b = _dibBitsBacking[i];
+            byte g = _dibBitsBacking[i + 1];
+            byte r = _dibBitsBacking[i + 2];
+            byte a = _dibBitsBacking[i + 3];
+            if (a == 0)
             {
-                byte b = _dibBitsBacking[i];
-                byte g = _dibBitsBacking[i + 1];
-                byte r = _dibBitsBacking[i + 2];
-                byte a = _dibBitsBacking[i + 3];
-                if (a == 0)
-                {
-                    _dibBitsBacking[i] = 0;
-                    _dibBitsBacking[i + 1] = 0;
-                    _dibBitsBacking[i + 2] = 0;
-                }
-                else if (a < 255)
-                {
-                    _dibBitsBacking[i] = (byte)((b * a) / 255);
-                    _dibBitsBacking[i + 1] = (byte)((g * a) / 255);
-                    _dibBitsBacking[i + 2] = (byte)((r * a) / 255);
-                }
-                // a stays the same
+                _dibBitsBacking[i] = 0;
+                _dibBitsBacking[i + 1] = 0;
+                _dibBitsBacking[i + 2] = 0;
             }
+            else if (a < 255)
+            {
+                _dibBitsBacking[i] = (byte)((b * a) / 255);
+                _dibBitsBacking[i + 1] = (byte)((g * a) / 255);
+                _dibBitsBacking[i + 2] = (byte)((r * a) / 255);
+            }
+            // a stays the same
         }
+
+        // Write the premultiplied pixels BACK to the DIB so UpdateLayeredWindow sees them.
+        Marshal.Copy(_dibBitsBacking, 0, _dibBits, byteCount);
 
         // Present via UpdateLayeredWindow with per-pixel alpha.
         var blend = new BlendFunction
@@ -598,12 +622,15 @@ internal static class Program
                 return;
             }
 
+            _dibBits = bits;  // keep the raw pointer to DIB pixel memory
+
             _oldDib = SelectObject(_memDc, _dib);
 
-            // Create a managed byte[] view over the DIB bits so we can clear and post-process them.
+            // Allocate a managed byte[] buffer for post-processing (read → premultiply → write).
+            // We don't pre-fill it here; RenderAndPresent will Marshal.Copy from _dibBits into it
+            // after DrawText, process it, then Marshal.Copy back.
             int byteCount = width * height * 4;
             _dibBitsBacking = new byte[byteCount];
-            Marshal.Copy(bits, _dibBitsBacking, 0, byteCount);
 
             _dibWidth = width;
             _dibHeight = height;
@@ -634,6 +661,7 @@ internal static class Program
             DeleteObject(_dib);
             _dib = IntPtr.Zero;
         }
+        _dibBits = IntPtr.Zero;
         _dibWidth = 0;
         _dibHeight = 0;
         _dibBitsBacking = null;
@@ -1140,4 +1168,7 @@ internal static class Program
 
     [DllImport("gdi32.dll", SetLastError = true)]
     private static extern IntPtr CreateDIBSection(IntPtr hdc, ref BitmapInfo pbmi, uint usage, out IntPtr ppvBits, IntPtr hSection, uint dwOffset);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern void RtlZeroMemory(IntPtr destination, nuint length);
 }
