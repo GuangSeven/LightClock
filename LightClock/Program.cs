@@ -480,11 +480,19 @@ internal static class Program
             : _timeFontHandle;
 
         // Set up the memory DC for text rendering.
-        // Note: GDI text rendering on a 32-bit DIB produces straight-alpha (non-premultiplied)
-        // pixels by default. For UpdateLayeredWindow with AC_SRC_ALPHA, the bitmap must be
-        // premultiplied. We use SetTextColor + SetBkMode(TRANSPARENT) and then post-process
-        // the DIB bits to convert from straight to premultiplied alpha.
-        SetBkMode(_memDc, TransparentBkMode);
+        // We render with OPAQUE background mode and a sentinel 'background' color (magenta,
+        // RGB(255,0,255)) so we can distinguish background pixels from text pixels in
+        // post-processing. GDI's DrawText does NOT write the alpha channel of a 32-bit DIB,
+        // so we can't rely on alpha to tell us where text was drawn.
+        //
+        // After DrawText, we walk the pixels:
+        //   - Pixels exactly equal to magenta -> background -> set alpha = 0 (fully transparent).
+        //   - Pixels that aren't magenta -> text (or anti-aliased blend of text and magenta)
+        //     -> set alpha = 255 and un-blend the magenta out of the RGB to recover the true
+        //     text color. This gives smooth anti-aliased edges with proper per-pixel alpha.
+        uint bgColor = Rgb(255, 0, 255);  // magenta sentinel
+        SetBkMode(_memDc, OpaqueBkMode);
+        SetBkColor(_memDc, bgColor);
         SetTextColor(_memDc, TextColor);
 
         IntPtr oldFont = SelectObject(_memDc, _dateFontHandle);
@@ -509,9 +517,8 @@ internal static class Program
         SelectObject(_memDc, oldFont);
 
         // Copy the CURRENT DIB pixel data (post-DrawText) into our managed buffer so we can
-        // post-process it. This is a READ from DIB memory, NOT a write to it. After processing
-        // (straight→premultiplied alpha), we Marshal.Copy back into the DIB so UpdateLayeredWindow
-        // sees the premultiplied pixels.
+        // post-process it. This is a READ from DIB memory, NOT a write to it. After processing,
+        // we Marshal.Copy back into the DIB so UpdateLayeredWindow sees the correct pixels.
         int byteCount = width * height * 4;
         if (_dibBitsBacking == null || _dibBitsBacking.Length != byteCount)
         {
@@ -519,32 +526,77 @@ internal static class Program
         }
         Marshal.Copy(_dibBits, _dibBitsBacking, 0, byteCount);
 
-        // Convert straight-alpha to premultiplied-alpha in-place in the managed buffer.
-        // GDI leaves the DIB with: B, G, R, A where A is the alpha from text anti-aliasing
-        // (0 where background, 255 where glyph interior, intermediate at edges).
-        // We need premultiplied: B*A/255, G*A/255, R*A/255, A.
+        // Post-process: convert magenta-background + text-foreground into per-pixel ARGB.
+        //
+        // GDI anti-aliasing blends text color (T) with background color (B = magenta) at edge
+        // pixels: result = T*alpha + B*(1-alpha), where alpha is the text coverage (0..1).
+        // Solving for alpha:
+        //   For each channel c: result_c = T_c * alpha + B_c * (1 - alpha)
+        //                       alpha = (result_c - B_c) / (T_c - B_c)
+        // We compute alpha from the channel where (T_c - B_c) is largest (most sensitive),
+        // then un-blend to recover T_c, then write premultiplied ARGB.
+        //
+        // For magenta (255,0,255) and our text color (195,236,244):
+        //   - Red channel: T_r=195, B_r=255 → diff=-60 (background is BRIGHTER than text)
+        //   - Green channel: T_g=236, B_g=0 → diff=236 (best signal)
+        //   - Blue channel: T_b=244, B_b=255 → diff=-11
+        // We use the green channel for alpha computation since it has the largest |diff|.
+        // TextColor components: T = (195, 236, 244) — used in alpha computation comments above.
+        // Magenta background components: B = (255, 0, 255).
+        byte bR = 255, bG = 0, bB = 255;    // magenta background components
         for (int i = 0; i < _dibBitsBacking.Length; i += 4)
         {
-            byte b = _dibBitsBacking[i];
+            byte b = _dibBitsBacking[i];        // DIB layout is BGRA
             byte g = _dibBitsBacking[i + 1];
             byte r = _dibBitsBacking[i + 2];
-            byte a = _dibBitsBacking[i + 3];
-            if (a == 0)
+            // byte a = _dibBitsBacking[i + 3];  // untouched by GDI; we'll set it ourselves
+
+            // Detect pure background (magenta) — use a small tolerance for safety.
+            if (r >= 250 && g <= 5 && b >= 250)
+            {
+                // Background: fully transparent.
+                _dibBitsBacking[i] = 0;
+                _dibBitsBacking[i + 1] = 0;
+                _dibBitsBacking[i + 2] = 0;
+                _dibBitsBacking[i + 3] = 0;
+                continue;
+            }
+
+            // Compute alpha (0..255) from the green channel (largest |T-B| diff).
+            // alpha = (g - bG) / (tG - bG) * 255  (clamped 0..255)
+            // Since bG=0 and tG=236: alpha = g * 255 / 236
+            int alpha = (g * 255) / 236;
+            if (alpha > 255) alpha = 255;
+            if (alpha < 0) alpha = 0;
+
+            if (alpha == 0)
             {
                 _dibBitsBacking[i] = 0;
                 _dibBitsBacking[i + 1] = 0;
                 _dibBitsBacking[i + 2] = 0;
+                _dibBitsBacking[i + 3] = 0;
             }
-            else if (a < 255)
+            else
             {
-                _dibBitsBacking[i] = (byte)((b * a) / 255);
-                _dibBitsBacking[i + 1] = (byte)((g * a) / 255);
-                _dibBitsBacking[i + 2] = (byte)((r * a) / 255);
+                // Un-blend: recover true text color for this pixel.
+                // result = T*alpha + B*(1-alpha) → T = (result - B*(1-alpha)) / alpha
+                // For premultiplied output we want T*alpha, so:
+                //   premultiplied = result - B*(1-alpha) = result - B + B*alpha
+                // We compute premultiplied B, G, R directly.
+                int pmB = b - (bB * (255 - alpha) + 128) / 255;
+                int pmG = g - (bG * (255 - alpha) + 128) / 255;
+                int pmR = r - (bR * (255 - alpha) + 128) / 255;
+                if (pmB < 0) pmB = 0; if (pmB > 255) pmB = 255;
+                if (pmG < 0) pmG = 0; if (pmG > 255) pmG = 255;
+                if (pmR < 0) pmR = 0; if (pmR > 255) pmR = 255;
+                _dibBitsBacking[i] = (byte)pmB;
+                _dibBitsBacking[i + 1] = (byte)pmG;
+                _dibBitsBacking[i + 2] = (byte)pmR;
+                _dibBitsBacking[i + 3] = (byte)alpha;
             }
-            // a stays the same
         }
 
-        // Write the premultiplied pixels BACK to the DIB so UpdateLayeredWindow sees them.
+        // Write the processed pixels BACK to the DIB so UpdateLayeredWindow sees them.
         Marshal.Copy(_dibBitsBacking, 0, _dibBits, byteCount);
 
         // Present via UpdateLayeredWindow with per-pixel alpha.
@@ -557,16 +609,39 @@ internal static class Program
         };
         var zeroPt = new Point { x = 0, y = 0 };
         var size = new Size { cx = width, cy = height };
-        UpdateLayeredWindow(
-            hwnd,
-            IntPtr.Zero,        // hdcDst - screen DC (NULL = default)
-            IntPtr.Zero,        // pptDst - NULL = keep current position
-            ref size,           // psize - new window size
-            _memDc,             // hdcSrc - source DC
-            ref zeroPt,         // pptSrc - source origin
-            0,                  // crKey - color key (unused with ULW_ALPHA)
-            ref blend,
-            UlwAlpha);
+
+        // UpdateLayeredWindow requires a screen DC (hdcDst) and the window's current position
+        // (pptDst). Passing NULL for either causes the function to silently fail on some
+        // Windows versions, leaving the window completely invisible (process running but
+        // no GUI shown). We fetch the actual window rect via GetWindowRect to be safe.
+        GetWindowRect(hwnd, out var windowRect);
+        var dstPt = new Point { x = windowRect.left, y = windowRect.top };
+
+        IntPtr screenDc = GetDC(IntPtr.Zero);
+        if (screenDc == IntPtr.Zero)
+        {
+            return;
+        }
+        try
+        {
+            UpdateLayeredWindow(
+                hwnd,
+                screenDc,         // hdcDst - real screen DC (not NULL)
+                ref dstPt,        // pptDst - window's current position (not NULL)
+                ref size,         // psize - new window size
+                _memDc,           // hdcSrc - source DC
+                ref zeroPt,       // pptSrc - source origin
+                0,                // crKey - color key (unused with ULW_ALPHA)
+                ref blend,
+                UlwAlpha);
+            // Return value is non-zero on success; we don't currently surface failures
+            // because there's no logging channel, but the explicit DC + position fix above
+            // addresses the most common 'invisible window' bug.
+        }
+        finally
+        {
+            ReleaseDC(IntPtr.Zero, screenDc);
+        }
     }
 
     /// <summary>
@@ -1081,7 +1156,7 @@ internal static class Program
     private static extern bool UpdateLayeredWindow(
         IntPtr hwnd,
         IntPtr hdcDst,
-        IntPtr pptDst,
+        ref Point pptDst,
         ref Size psize,
         IntPtr hdcSrc,
         ref Point pptSrc,
@@ -1116,6 +1191,9 @@ internal static class Program
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetClientRect(IntPtr hWnd, out Rect lpRect);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool GetWindowRect(IntPtr hWnd, out Rect lpRect);
+
     [DllImport("gdi32.dll", SetLastError = true)]
     private static extern IntPtr CreateSolidBrush(uint colorRef);
 
@@ -1124,6 +1202,9 @@ internal static class Program
 
     [DllImport("gdi32.dll", SetLastError = true)]
     private static extern int SetBkMode(IntPtr hdc, int mode);
+
+    [DllImport("gdi32.dll", SetLastError = true)]
+    private static extern uint SetBkColor(IntPtr hdc, uint color);
 
     [DllImport("gdi32.dll", SetLastError = true)]
     private static extern uint SetTextColor(IntPtr hdc, uint color);
