@@ -730,13 +730,17 @@ internal static class Program
         var now = DateTime.Now;
         if (_language == "zh")
         {
-            // Chinese: build the date string manually to avoid .NET's zh-CN culture inserting
-            // spaces between components (e.g. "7 月 1日" instead of "7月1日"). We use the
-            // culture only to get the localized weekday name, then assemble the final string
-            // ourselves with no extra spaces.
+            // Chinese: build the date string manually to avoid .NET's zh-CN DateTimeFormat
+            // inserting spaces between numeric components (e.g. "7 月 1日" instead of "7月1日").
+            // We use the culture only to get the localized weekday name, then assemble the
+            // final string ourselves — numeric parts have no surrounding spaces, but a single
+            // space is intentionally kept before the weekday (e.g. "7月1日 星期三").
+            //
+            // GetCultureInfo returns a cached instance (unlike 'new CultureInfo' which allocates),
+            // and this method runs every second on the timer tick.
             try
             {
-                var ci = new System.Globalization.CultureInfo("zh-CN");
+                var ci = System.Globalization.CultureInfo.GetCultureInfo("zh-CN");
                 // zh-CN's default DateTimeFormatInfo.DayNames gives "星期日","星期一",...,"星期六".
                 string weekday = ci.DateTimeFormat.DayNames[(int)now.DayOfWeek];
                 _dateText = $"{now.Month}月{now.Day}日 {weekday}";
@@ -744,8 +748,8 @@ internal static class Program
             }
             catch
             {
-                // CultureInfo not available — fall back to English.
-                var enCi = new System.Globalization.CultureInfo("en-US");
+                // CultureInfo not available (e.g. invariant-globalization mode) — fall back to English.
+                var enCi = System.Globalization.CultureInfo.GetCultureInfo("en-US");
                 _dateText = now.ToString("dddd, MMMM d", enCi);
                 _timeText = now.ToString("HH:mm", enCi);
             }
@@ -756,7 +760,10 @@ internal static class Program
             // always English, regardless of the system's default UI language. Without this,
             // 'now.ToString("dddd, MMMM d")' uses the current thread culture (which on a
             // Chinese Windows is zh-CN), producing '星期三, 7月 1' instead of 'Wednesday, July 1'.
-            var enCi = new System.Globalization.CultureInfo("en-US");
+            //
+            // GetCultureInfo returns a cached instance (unlike 'new CultureInfo' which allocates),
+            // and this method runs every second on the timer tick.
+            var enCi = System.Globalization.CultureInfo.GetCultureInfo("en-US");
             _dateText = now.ToString("dddd, MMMM d", enCi);
             _timeText = now.ToString("HH:mm", enCi);
         }
