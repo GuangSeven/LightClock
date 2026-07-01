@@ -730,24 +730,42 @@ internal static class Program
         var now = DateTime.Now;
         if (_language == "zh")
         {
-            // Chinese: use the system's zh-CN culture if available, otherwise fall back to invariant.
+            // Chinese: build the date string manually to avoid .NET's zh-CN DateTimeFormat
+            // inserting spaces between numeric components (e.g. "7 月 1日" instead of "7月1日").
+            // We use the culture only to get the localized weekday name, then assemble the
+            // final string ourselves — numeric parts have no surrounding spaces, but a single
+            // space is intentionally kept before the weekday (e.g. "7月1日 星期三").
+            //
+            // GetCultureInfo returns a cached instance (unlike 'new CultureInfo' which allocates),
+            // and this method runs every second on the timer tick.
             try
             {
-                var ci = new System.Globalization.CultureInfo("zh-CN");
-                _dateText = now.ToString("M月d日 dddd", ci);
+                var ci = System.Globalization.CultureInfo.GetCultureInfo("zh-CN");
+                // zh-CN's default DateTimeFormatInfo.DayNames gives "星期日","星期一",...,"星期六".
+                string weekday = ci.DateTimeFormat.DayNames[(int)now.DayOfWeek];
+                _dateText = $"{now.Month}月{now.Day}日 {weekday}";
                 _timeText = now.ToString("HH:mm", ci);
             }
             catch
             {
-                // CultureInfo not available — fall back to English.
-                _dateText = now.ToString("dddd, MMMM d");
-                _timeText = now.ToString("HH:mm");
+                // CultureInfo not available (e.g. invariant-globalization mode) — fall back to English.
+                var enCi = System.Globalization.CultureInfo.GetCultureInfo("en-US");
+                _dateText = now.ToString("dddd, MMMM d", enCi);
+                _timeText = now.ToString("HH:mm", enCi);
             }
         }
         else
         {
-            _dateText = now.ToString("dddd, MMMM d");
-            _timeText = now.ToString("HH:mm");
+            // English: explicitly use en-US culture so the weekday and month names are
+            // always English, regardless of the system's default UI language. Without this,
+            // 'now.ToString("dddd, MMMM d")' uses the current thread culture (which on a
+            // Chinese Windows is zh-CN), producing '星期三, 7月 1' instead of 'Wednesday, July 1'.
+            //
+            // GetCultureInfo returns a cached instance (unlike 'new CultureInfo' which allocates),
+            // and this method runs every second on the timer tick.
+            var enCi = System.Globalization.CultureInfo.GetCultureInfo("en-US");
+            _dateText = now.ToString("dddd, MMMM d", enCi);
+            _timeText = now.ToString("HH:mm", enCi);
         }
     }
 
@@ -840,8 +858,18 @@ internal static class Program
     {
         try
         {
-            int result = RegOpenKeyEx(HkeyCurrentUser, AutoStartRegistryKey, 0, 0x000F003F /* KEY_ALL_ACCESS */, out IntPtr hKey);
-            if (result != 0) return;
+            // KEY_SET_VALUE (0x0002) is all we need for both RegSetValueEx and RegDeleteValue.
+            // Requesting KEY_ALL_ACCESS can fail on locked-down systems where the user has
+            // restricted registry permissions, even for their own HKCU.
+            const int keyValue = 0x0002;
+            int result = RegOpenKeyEx(HkeyCurrentUser, AutoStartRegistryKey, 0, keyValue, out IntPtr hKey);
+            if (result != 0)
+            {
+                // Could not open the Run key. SaveSettings() will still persist the preference
+                // to settings.json, so on next launch LoadSettings() will retry via the
+                // 'if (_autoStart) SetAutoStart(true)' call.
+                return;
+            }
             try
             {
                 if (enable)
@@ -853,11 +881,24 @@ internal static class Program
                     if (!string.IsNullOrEmpty(exePath))
                     {
                         string value = "\"" + exePath + "\"";
-                        RegSetValueEx(hKey, AutoStartValueName, 0, 1 /* REG_SZ */, value);
+                        // RegSetValueExW expects UTF-16 bytes including the null terminator.
+                        // The previous P/Invoke signature took 'string lpData' which caused
+                        // the marshaler to pass a pointer without the correct cbData length,
+                        // leading to either a silent write failure or a crash when Windows
+                        // tried to read past the buffer.
+                        byte[] data = System.Text.Encoding.Unicode.GetBytes(value + "\0");
+                        int setResult = RegSetValueEx(hKey, AutoStartValueName, 0, 1 /* REG_SZ */, data, (uint)data.Length);
+                        if (setResult != 0)
+                        {
+                            // Write failed — settings.json still records the intent; LoadSettings
+                            // will retry on next launch.
+                        }
                     }
                 }
                 else
                 {
+                    // RegDeleteValue returns 2 (ERROR_FILE_NOT_FOUND) if the value doesn't exist,
+                    // which is fine for our "disable" semantics — treat as success.
                     RegDeleteValue(hKey, AutoStartValueName);
                 }
             }
@@ -868,7 +909,8 @@ internal static class Program
         }
         catch
         {
-            // Auto-start is best-effort — ignore registry failures.
+            // Auto-start is best-effort — ignore registry failures. The user's intent is still
+            // persisted in settings.json, so we'll retry on next launch.
         }
     }
 
@@ -1146,7 +1188,7 @@ internal static class Program
     private static extern int RegOpenKeyEx(IntPtr hKey, string lpSubKey, uint ulOptions, int samDesired, out IntPtr phkResult);
 
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "RegSetValueExW")]
-    private static extern int RegSetValueEx(IntPtr hKey, string lpValueName, uint reserved, uint dwType, string lpData);
+    private static extern int RegSetValueEx(IntPtr hKey, string lpValueName, uint reserved, uint dwType, byte[] lpData, uint cbData);
 
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern int RegDeleteValue(IntPtr hKey, string lpValueName);
