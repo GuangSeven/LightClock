@@ -1,32 +1,69 @@
-# Build artifacts
-bin/
-obj/
-*.user
-.vs/
-*.suo
+```
+# Compiled and build artifacts
+*.exe
+*.dll
+*.so
+*.a
+*.obj
+*.out
+*.pyc
+*.class
+*.o
+build/
+dist/
+target/
 
-# NuGet
-*.nupkg
-*.snupkg
-packages/
-*.lock.json
+# Dependencies
+node_modules/
+venv/
+.venv/
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+.gradle/
+julia-*/
+zig*/
 
-# Publish output
-publish/
-AppPackages/
-BundleArtifacts/
-
-# VS Code
+# Editors
 .vscode/
-
-# Rider
 .idea/
+*.swp
+*.swo
 
-# Test results
-TestResults/
-
-# Misc
-*.orig
-*.rej
+# System files
+.DS_Store
 Thumbs.db
-Desktop.ini
+.env
+.env.local
+*.env.*
+
+# Logs and coverage
+*.log
+coverage/
+htmlcov/
+.coverage
+
+# Compressed files
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+*.lz4
+*.lzh
+*.cab
+*.arj
+*.rpm
+*.deb
+*.Z
+*.lz
+*.lzo
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.zst
+```
