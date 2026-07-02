@@ -34,6 +34,7 @@ internal static class Program
     private const int SwpShowWindow = 0x0040;
     private const int SwpHideWindow = 0x0080;
     private const int SwpNoactivate = 0x0010;
+    private const int SwpNozorder = 0x0004;
 
     private const uint LwaColorKey = 0x00000001;
     private const uint LwaAlpha = 0x00000002;
@@ -134,6 +135,12 @@ internal static class Program
     // Loaded icon handle. Tracked so we can free it on exit instead of leaking it.
     private static IntPtr _hIcon = IntPtr.Zero;
     private static int _dpi = 96;
+
+    // Win11 PerMonitorV2 sends WM_DPICHANGED synchronously during CreateWindowEx (Win10 does not).
+    // We must NOT call UpdateLayeredWindow before the window is fully initialized — doing so
+    // causes DWM to access uninitialized state and crash on Win11. This flag gates RenderAndPresent
+    // so it only runs after CreateWindowEx returns.
+    private static bool _windowReady = false;
 
     // Cached 32-bit ARGB DIB section + its DC + old bitmap, used for per-pixel-alpha rendering.
     // Recreated only when window size or DPI changes.
@@ -257,6 +264,25 @@ internal static class Program
         {
             return;
         }
+
+        // CRITICAL (Win11 crash fix): query the actual DPI of the monitor the window was created on.
+        // On Win11 with PerMonitorV2, CreateWindowEx creates the window at the monitor's native DPI
+        // (e.g. 144 for 150% scaling). WM_DPICHANGED may fire synchronously during CreateWindowEx,
+        // but it's not guaranteed — and even when it does, our handler skips rendering while
+        // !_windowReady (see below). So we explicitly query the DPI here, after CreateWindowEx
+        // returns, to ensure the first RenderAndPresent uses the correct font heights.
+        //
+        // GetDpiForWindow is available on Windows 10 1607+ and Windows 11. If it returns 0
+        // (very old system), we fall back to 96.
+        uint queriedDpi = GetDpiForWindow(hwnd);
+        if (queriedDpi > 0 && queriedDpi != (uint)_dpi)
+        {
+            _dpi = (int)queriedDpi;
+        }
+
+        // Mark the window as ready — from now on, WM_DPICHANGED and WM_TIMER can safely call
+        // RenderAndPresent (which calls UpdateLayeredWindow).
+        _windowReady = true;
 
         // Use per-pixel alpha (UpdateLayeredWindow) instead of color-key transparency.
         // Color-key (LwaColorKey) produces a visible dark fringe around anti-aliased glyphs because
@@ -448,7 +474,7 @@ internal static class Program
                 return (IntPtr)1;
 
             case WmDpiChanged:
-                // wParam = new DPI (HIWORD = y dpi, LOWORD = x dpi). lParam = suggested rect.
+                // wParam = new DPI (HIWORD = y dpi, LOWORD = x dpi). lParam = pointer to suggested RECT.
                 int newDpi = (int)(((ulong)(long)wParam >> 16) & 0xFFFF);
                 if (newDpi > 0 && newDpi != _dpi)
                 {
@@ -466,7 +492,27 @@ internal static class Program
                     }
                     // Free the DIB so it gets recreated at the new size.
                     FreeDib();
-                    RenderAndPresent(hwnd);
+
+                    // Per MSDN, the app should respond to WM_DPICHANGED by resizing its window
+                    // to the suggested rect in lParam. We apply it via SetWindowPos.
+                    if (lParam != IntPtr.Zero)
+                    {
+                        var suggestedRect = Marshal.PtrToStructure<Rect>(lParam);
+                        SetWindowPos(hwnd, IntPtr.Zero,
+                            suggestedRect.left, suggestedRect.top,
+                            suggestedRect.right - suggestedRect.left,
+                            suggestedRect.bottom - suggestedRect.top,
+                            SwpNozorder | SwpNoactivate);
+                    }
+
+                    // Only render if the window is fully initialized. On Win11, WM_DPICHANGED can
+                    // fire synchronously during CreateWindowEx — calling UpdateLayeredWindow at
+                    // that point crashes DWM. The _windowReady flag is set after CreateWindowEx
+                    // returns in Run().
+                    if (_windowReady)
+                    {
+                        RenderAndPresent(hwnd);
+                    }
                 }
                 return IntPtr.Zero;
 
@@ -853,32 +899,32 @@ internal static class Program
 
             // Language submenu
             IntPtr langMenu = CreatePopupMenu();
-            AppendMenu(langMenu, MfString | (_language == "en" ? MfChecked : MfUnchecked), CmdLanguageEn, "English");
-            AppendMenu(langMenu, MfString | (_language == "zh" ? MfChecked : MfUnchecked), CmdLanguageZh, "中文 (Chinese)");
-            AppendMenu(menu, MfString | 0x0010 /* MF_POPUP */, (uint)langMenu.ToInt64(), "Language");
+            AppendMenu(langMenu, MfString | (_language == "en" ? MfChecked : MfUnchecked), (IntPtr)CmdLanguageEn, "English");
+            AppendMenu(langMenu, MfString | (_language == "zh" ? MfChecked : MfUnchecked), (IntPtr)CmdLanguageZh, "中文 (Chinese)");
+            AppendMenu(menu, MfString | 0x0010 /* MF_POPUP */, langMenu, "Language");
 
             // Font submenu (affects time display only; date always uses Segoe UI for proportional look)
             IntPtr fontMenu = CreatePopupMenu();
-            AppendMenu(fontMenu, MfString | (_timeFontName == "Segoe UI" ? MfChecked : MfUnchecked), CmdFontSegoUi, "Segoe UI");
-            AppendMenu(fontMenu, MfString | (_timeFontName == "Consolas" ? MfChecked : MfUnchecked), CmdFontConsolas, "Consolas");
-            AppendMenu(fontMenu, MfString | (_timeFontName == "Cascadia Code" ? MfChecked : MfUnchecked), CmdFontCascadiaCode, "Cascadia Code");
-            AppendMenu(fontMenu, MfString | (_timeFontName == "Microsoft YaHei" ? MfChecked : MfUnchecked), CmdFontMicrosoftYaHei, "Microsoft YaHei");
+            AppendMenu(fontMenu, MfString | (_timeFontName == "Segoe UI" ? MfChecked : MfUnchecked), (IntPtr)CmdFontSegoUi, "Segoe UI");
+            AppendMenu(fontMenu, MfString | (_timeFontName == "Consolas" ? MfChecked : MfUnchecked), (IntPtr)CmdFontConsolas, "Consolas");
+            AppendMenu(fontMenu, MfString | (_timeFontName == "Cascadia Code" ? MfChecked : MfUnchecked), (IntPtr)CmdFontCascadiaCode, "Cascadia Code");
+            AppendMenu(fontMenu, MfString | (_timeFontName == "Microsoft YaHei" ? MfChecked : MfUnchecked), (IntPtr)CmdFontMicrosoftYaHei, "Microsoft YaHei");
             // Show a checkmark on "Custom..." only if the current font is NOT one of the four presets.
             bool isPreset = _timeFontName == "Segoe UI" || _timeFontName == "Consolas" ||
                             _timeFontName == "Cascadia Code" || _timeFontName == "Microsoft YaHei";
-            AppendMenu(fontMenu, MfSeparator, 0, null);
-            AppendMenu(fontMenu, MfString | (!isPreset ? MfChecked : MfUnchecked), CmdFontCustom, "Custom...");
-            AppendMenu(menu, MfString | 0x0010 /* MF_POPUP */, (uint)fontMenu.ToInt64(), "Font");
+            AppendMenu(fontMenu, MfSeparator, IntPtr.Zero, null);
+            AppendMenu(fontMenu, MfString | (!isPreset ? MfChecked : MfUnchecked), (IntPtr)CmdFontCustom, "Custom...");
+            AppendMenu(menu, MfString | 0x0010 /* MF_POPUP */, fontMenu, "Font");
 
             // Start with Windows (toggle)
-            AppendMenu(menu, MfString | (_autoStart ? MfChecked : MfUnchecked), CmdToggleAutoStart, "Start with Windows");
+            AppendMenu(menu, MfString | (_autoStart ? MfChecked : MfUnchecked), (IntPtr)CmdToggleAutoStart, "Start with Windows");
 
             // Wallpaper color (toggle) - Material You style text color extraction
-            AppendMenu(menu, MfString | (_useWallpaperColor ? MfChecked : MfUnchecked), CmdToggleWallpaperColor, "Wallpaper Color");
+            AppendMenu(menu, MfString | (_useWallpaperColor ? MfChecked : MfUnchecked), (IntPtr)CmdToggleWallpaperColor, "Wallpaper Color");
 
             // Exit
-            AppendMenu(menu, MfSeparator, 0, null);
-            AppendMenu(menu, MfString, CmdExit, "Exit");
+            AppendMenu(menu, MfSeparator, IntPtr.Zero, null);
+            AppendMenu(menu, MfString, (IntPtr)CmdExit, "Exit");
 
             GetCursorPos(out var point);
             SetForegroundWindow(hwnd);
@@ -1889,7 +1935,7 @@ internal static class Program
     private static extern IntPtr CreatePopupMenu();
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool AppendMenu(IntPtr hMenu, uint uFlags, uint uIDNewItem, string? lpNewItem);
+    private static extern bool AppendMenu(IntPtr hMenu, uint uFlags, IntPtr uIDNewItem, string? lpNewItem);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool DestroyMenu(IntPtr hMenu);
@@ -1914,6 +1960,9 @@ internal static class Program
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool DestroyIcon(IntPtr hIcon);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetDpiForWindow(IntPtr hwnd);
 
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern int RegOpenKeyEx(IntPtr hKey, string lpSubKey, uint ulOptions, int samDesired, out IntPtr phkResult);
