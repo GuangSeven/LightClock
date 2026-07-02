@@ -40,31 +40,24 @@ jobs:
       - name: Restore (${{ matrix.rid }})
         run: dotnet restore .\LightClock\LightClock.csproj -r ${{ matrix.rid }}
 
-      - name: Publish self-contained (${{ matrix.rid }})
-        # IMPORTANT: do NOT pass --no-build here.
+      - name: Publish framework-dependent (${{ matrix.rid }})
+        # Framework-dependent build: the artifact is ~200 KB (just LightClock.dll/exe + Assets/).
+        # Users must install the .NET 8 Desktop Runtime separately from
+        # https://dotnet.microsoft.com/download/dotnet/8.0
         #
-        # The .NET SDK generates the runtimeconfig.json differently for `build` vs `publish`:
-        #   - `dotnet build` produces a framework-dependent runtimeconfig.json that references
-        #     "framework": { "name": "Microsoft.NETCore.App", "version": "8.0.0" }.
-        #   - `dotnet publish --self-contained` produces a self-contained runtimeconfig.json
-        #     with "includedFrameworks": [{ "name": "Microsoft.NETCore.App", "version": "8.0.28" }]
-        #     and includes coreclr.dll / System.Private.CoreLib.dll in the output.
+        # We use --self-contained false so the .NET runtime is NOT bundled.
+        # The -r flag is still needed to produce the correct native apphost (LightClock.exe)
+        # for each architecture (x64/x86/arm64). The .dll and .runtimeconfig.json are
+        # identical across architectures.
         #
-        # If publish is run with --no-build, it SKIPS the runtimeconfig.json regeneration
-        # step and just copies the framework-dependent version produced by `build`. The
-        # resulting artifact then has coreclr.dll bundled (so it LOOKS self-contained) but
-        # the runtimeconfig.json still declares a global framework reference to
-        # Microsoft.NETCore.App 8.0.0 — which causes hostfx to fail with the misleading
-        # "You must install or update .NET to run this application" error on machines that
-        # don't have the .NET 8 runtime installed.
-        #
-        # Letting publish run its own build step ensures the runtimeconfig.json is
-        # regenerated correctly for the self-contained scenario.
+        # IMPORTANT: do NOT pass --no-build here. The .NET SDK generates the runtimeconfig.json
+        # differently for `build` vs `publish`. Letting publish run its own build step ensures
+        # the runtimeconfig.json is generated correctly.
         run: >
           dotnet publish .\LightClock\LightClock.csproj
           -c Release
           -r ${{ matrix.rid }}
-          --self-contained true
+          --self-contained false
           -p:Platform=${{ matrix.platform }}
           -o .\publish-${{ matrix.rid }}
 
@@ -99,3 +92,17 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: LightClock-win-*.zip
+          body: |
+            ## Requirements
+
+            Install the **.NET 8 Desktop Runtime** from https://dotnet.microsoft.com/download/dotnet/8.0
+            (pick the "Desktop Runtime" matching your Windows architecture: x64 / x86 / arm64).
+
+            ## Download
+
+            Pick the zip matching your Windows architecture:
+            - `LightClock-win-x64.zip` — Intel/AMD 64-bit (most users)
+            - `LightClock-win-x86.zip` — 32-bit Windows
+            - `LightClock-win-arm64.zip` — Surface Pro X / Snapdragon laptops
+
+            Unzip and double-click `LightClock.exe`.
