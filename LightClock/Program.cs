@@ -157,7 +157,6 @@ internal static class Program
     // instead we sample once on startup and re-sample when this many timer ticks have elapsed.
     private const int WallpaperResampleIntervalTicks = 300;  // 300 seconds = 5 minutes
     private static int _wallpaperResampleCounter = 0;
-    private static string? _lastWallpaperPath;
 
     [STAThread]
     private static void Main()
@@ -1240,12 +1239,11 @@ internal static class Program
                 return;
             }
 
-            // Avoid re-processing the same file if it hasn't changed.
-            if (wallpaperPath == _lastWallpaperPath)
-            {
-                return;
-            }
-            _lastWallpaperPath = wallpaperPath;
+            // Always re-extract the color from the current wallpaper. This ensures that
+            // when the user changes their desktop wallpaper, the clock color updates
+            // accordingly (within the resample interval). We don't cache by path alone
+            // because the same path may point to different content over time (e.g. the
+            // user replaces the file, or Windows updates the TranscodedWallpaper cache).
 
             // Load the image, downsample to 64x64, compute the dominant color via a simple
             // histogram-based algorithm (similar to Android's Monet extraction).
