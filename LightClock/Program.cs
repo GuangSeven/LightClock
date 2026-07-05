@@ -810,7 +810,7 @@ internal static class Program
             _memDc = CreateCompatibleDC(screenDc);
             if (_memDc == IntPtr.Zero)
             {
-                return;
+                return;  // screen DC released by finally
             }
 
             var bmi = new BitmapInfo
@@ -834,6 +834,7 @@ internal static class Program
             _dib = CreateDIBSection(screenDc, ref bmi, DibRgbColors, out IntPtr bits, IntPtr.Zero, 0);
             if (_dib == IntPtr.Zero)
             {
+                // Free the memory DC we created above so it doesn't leak on this failure path.
                 DeleteDC(_memDc);
                 _memDc = IntPtr.Zero;
                 return;
@@ -841,7 +842,18 @@ internal static class Program
 
             _dibBits = bits;  // keep the raw pointer to DIB pixel memory
 
-            _oldDib = SelectObject(_memDc, _dib);
+            IntPtr oldDib = SelectObject(_memDc, _dib);
+            if (oldDib == IntPtr.Zero)
+            {
+                // SelectObject failed — the DIB can't be used. Free everything we allocated.
+                DeleteObject(_dib);
+                _dib = IntPtr.Zero;
+                _dibBits = IntPtr.Zero;
+                DeleteDC(_memDc);
+                _memDc = IntPtr.Zero;
+                return;
+            }
+            _oldDib = oldDib;
 
             // Allocate a managed byte[] buffer for post-processing (read → premultiply → write).
             // We don't pre-fill it here; RenderAndPresent will Marshal.Copy from _dibBits into it
@@ -895,7 +907,10 @@ internal static class Program
         try
         {
             // Always on Top (toggle)
-            AppendMenu(menu, MfString | (_alwaysOnTop ? MfChecked : MfUnchecked), CmdToggleTopMost, "Always on Top");
+            // Cast command IDs to IntPtr for consistency with the AppendMenu signature
+            // (uIDNewItem is UINT_PTR). Implicit int→IntPtr conversion works on .NET 5+,
+            // but being explicit makes the pointer-width contract obvious to readers.
+            AppendMenu(menu, MfString | (_alwaysOnTop ? MfChecked : MfUnchecked), (IntPtr)CmdToggleTopMost, "Always on Top");
 
             // Language submenu
             IntPtr langMenu = CreatePopupMenu();
