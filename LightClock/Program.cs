@@ -1128,108 +1128,140 @@ internal static class Program
 
     /// <summary>
     /// Builds a minimal in-memory DLGTEMPLATE for the font-prompt dialog.
-    /// Layout: a 320x140 dialog with a label, an edit field, an OK button, and a Cancel button.
-    /// All coordinates are in dialog-template units (roughly 1/4 of the average char size).
+    /// Layout: a 300x120 dialog (in dialog-template units) with a label, an edit field,
+    /// an OK button, and a Cancel button.
+    ///
+    /// CRITICAL: every DLGITEMTEMPLATE must start on a DWORD (4-byte) boundary, and the
+    /// DLGTEMPLATE header + variable-length menu/class/title section must be padded to a
+    /// DWORD boundary before the first control. The previous implementation didn't add this
+    /// padding, so the first control started at byte offset 46 (not DWORD-aligned) and
+    /// DialogBoxIndirectParam silently failed — the dialog never appeared.
     /// </summary>
     private static byte[] BuildFontPromptTemplate()
     {
-        // DLGTEMPLATE structure (WORD-aligned):
-        //   WORD style; WORD exStyle; WORD cdit; short x, y, cx, cy;
-        // Followed by: menu (0xFFFF + 0x0000 = no menu), class (0xFFFF + 0x0000 = default), title (WCHAR*).
-        // Then for each control: DWORD style; DWORD exStyle; short x, y, cx, cy; WORD id;
-        //   then class (0xFFFF + atom OR WCHAR*), title (WCHAR*), extra data count (WORD).
-        // We use System.Drawing-less binary writer.
+        // DLGTEMPLATE layout (per Microsoft docs, all multi-byte fields are WORD-aligned
+        // within the variable section but each DLGITEMTEMPLATE must start on a DWORD boundary):
+        //   DWORD style
+        //   DWORD exStyle
+        //   WORD  cdit
+        //   short x, y, cx, cy  (4 × WORD = 8 bytes)
+        //   --- variable section (WORD-aligned) ---
+        //   menu:    0x0000 (none)  | 0xFFFF + atom | WCHAR string + \0
+        //   class:   0x0000 (default) | 0xFFFF + atom | WCHAR string + \0
+        //   title:   WCHAR string + \0
+        //   --- pad to DWORD boundary ---
+        //   for each control: DLGITEMTEMPLATE (DWORD-aligned start AND end)
         using var ms = new System.IO.MemoryStream();
         using var bw = new System.IO.BinaryWriter(ms, System.Text.Encoding.Unicode);
-        // Style: WS_POPUP | WS_VISIBLE | WS_CAPTION | DS_MODALFRAME | DS_CENTER
-        const uint style = 0x80000000 | 0x10000000 | 0x00C00000 | 0x00000080 /* DS_MODALFRAME */ | 0x00000800 /* DS_CENTER */;
+
+        // Helper: write padding bytes so the next write starts on a DWORD (4-byte) boundary.
+        void PadToDword()
+        {
+            long pos = ms.Length;
+            int pad = (int)(4 - (pos % 4)) % 4;
+            for (int i = 0; i < pad; i++) bw.Write((byte)0);
+        }
+
+        // Helper: write a null-terminated WCHAR string.
+        void WriteWString(string s)
+        {
+            foreach (char c in s) bw.Write((short)c);
+            bw.Write((short)0);
+        }
+
+        // ---- DLGTEMPLATE header ----
+        // Style: WS_POPUP | WS_VISIBLE | WS_CAPTION | DS_MODALFRAME | DS_CENTER | DS_SETFONT
+        // DS_SETFONT lets us specify the font (Segoe UI 9pt) so the dialog matches the system UI.
+        const uint WsPopup = 0x80000000;
+        const uint WsVisible = 0x10000000;
+        const uint WsCaption = 0x00C00000;
+        const uint DsModalframe = 0x00000080;
+        const uint DsCenter = 0x00000800;
+        const uint DsSetfont = 0x00000040;
+        const uint style = WsPopup | WsVisible | WsCaption | DsModalframe | DsCenter | DsSetfont;
         const uint exStyle = 0x00000000;
         const ushort cdit = 4;  // 4 controls: label, edit, OK, Cancel
-        // Dialog box rect (in dialog units): x=0, y=0, cx=300, cy=120
         bw.Write((uint)style);
         bw.Write((uint)exStyle);
         bw.Write((ushort)cdit);
-        bw.Write((short)0);   // x
-        bw.Write((short)0);   // y
-        bw.Write((short)300); // cx
-        bw.Write((short)120); // cy
-        // Menu: 0x0000 (no menu)
+        bw.Write((short)0);    // x
+        bw.Write((short)0);    // y
+        bw.Write((short)300);  // cx
+        bw.Write((short)120);  // cy
+
+        // ---- variable section (still WORD-aligned) ----
+        // Menu: 0x0000 = none
         bw.Write((ushort)0x0000);
-        // Window class: 0x0000 (default dialog class)
+        // Window class: 0x0000 = default dialog class
         bw.Write((ushort)0x0000);
-        // Title: "Custom Font"
-        foreach (char c in "Custom Font") bw.Write((short)c);
-        bw.Write((short)0);  // null terminator
-        // If DS_SETFONT were set, we'd add fontSize + fontName here. We don't, so skip.
+        // Title
+        WriteWString("Custom Font");
+        // DS_SETFONT: point size (WORD) + WCHAR font name + \0
+        bw.Write((short)9);  // 9pt
+        WriteWString("Segoe UI");
+
+        // ---- pad to DWORD boundary before first control ----
+        PadToDword();
+
+        // Helper to write a control. Each control's DLGITEMTEMPLATE starts AND ends on DWORD.
+        void WriteControl(uint ctrlStyle, uint ctrlExStyle, short x, short y, short cx, short cy,
+                          ushort id, ushort classAtom, string title)
+        {
+            PadToDword();  // ensure DWORD-aligned start
+            bw.Write((uint)ctrlStyle);
+            bw.Write((uint)ctrlExStyle);
+            bw.Write((short)x);
+            bw.Write((short)y);
+            bw.Write((short)cx);
+            bw.Write((short)cy);
+            bw.Write((ushort)id);
+            // Class: 0xFFFF + atom (WORD)
+            bw.Write((ushort)0xFFFF);
+            bw.Write((ushort)classAtom);
+            // Title
+            WriteWString(title);
+            // Extra data count (WORD) — 0 means no extra data
+            bw.Write((ushort)0);
+            // PadToDword() called at the start of the next WriteControl or end of function
+        }
 
         // --- Control 1: Label (static text) ---
+        // Class atom 0x0082 = WC_STATIC
         // Style: WS_CHILD | WS_VISIBLE | SS_LEFT
-        bw.Write((uint)(0x40000000 | 0x10000000 | 0x00000000));
-        bw.Write((uint)0);  // exStyle
-        bw.Write((short)10);   // x
-        bw.Write((short)10);   // y
-        bw.Write((short)280);  // cx
-        bw.Write((short)15);   // cy
-        bw.Write((ushort)IdcFontPromptLabel);  // id
-        // Class: 0xFFFF + 0x0082 (static)
-        bw.Write((ushort)0xFFFF);
-        bw.Write((ushort)0x0082);
-        // Title: "Enter font name (e.g. Arial, Times New Roman):"
-        foreach (char c in "Enter font name (e.g. Arial, Times New Roman):") bw.Write((short)c);
-        bw.Write((short)0);
-        bw.Write((ushort)0);  // extra data count
+        WriteControl(0x40000000 | 0x10000000, 0,
+            10, 10, 280, 15,
+            IdcFontPromptLabel, 0x0082,
+            "Enter font name (e.g. Arial, Times New Roman):");
 
         // --- Control 2: Edit field ---
+        // Class atom 0x0081 = WC_EDIT
         // Style: WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL
-        bw.Write((uint)(0x40000000 | 0x10000000 | 0x00800000 | 0x00010000 | 0x00000080));
-        bw.Write((uint)0x00000200);  // exStyle = WS_EX_CLIENTEDGE for a 3D sunken border
-        bw.Write((short)10);   // x
-        bw.Write((short)30);   // y
-        bw.Write((short)280);  // cx
-        bw.Write((short)20);   // cy
-        bw.Write((ushort)IdcFontPromptEdit);  // id
-        // Class: 0xFFFF + 0x0081 (edit)
-        bw.Write((ushort)0xFFFF);
-        bw.Write((ushort)0x0081);
-        // Title: empty
-        bw.Write((short)0);
-        bw.Write((ushort)0);  // extra data count
+        // exStyle: WS_EX_CLIENTEDGE for a 3D sunken border
+        WriteControl(0x40000000 | 0x10000000 | 0x00800000 | 0x00010000 | 0x00000080,
+            0x00000200,
+            10, 30, 280, 20,
+            IdcFontPromptEdit, 0x0081,
+            "");
 
-        // --- Control 3: OK button ---
+        // --- Control 3: OK button (default pushbutton) ---
+        // Class atom 0x0080 = WC_BUTTON
         // Style: WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON
-        bw.Write((uint)(0x40000000 | 0x10000000 | 0x00010000 | 0x00000001));
-        bw.Write((uint)0);
-        bw.Write((short)130); // x
-        bw.Write((short)65);  // y
-        bw.Write((short)70);  // cx
-        bw.Write((short)25);  // cy
-        bw.Write((ushort)Idok);
-        // Class: 0xFFFF + 0x0080 (button)
-        bw.Write((ushort)0xFFFF);
-        bw.Write((ushort)0x0080);
-        foreach (char c in "OK") bw.Write((short)c);
-        bw.Write((short)0);
-        bw.Write((ushort)0);
+        WriteControl(0x40000000 | 0x10000000 | 0x00010000 | 0x00000001,
+            0,
+            130, 65, 70, 25,
+            (ushort)Idok, 0x0080,
+            "OK");
 
         // --- Control 4: Cancel button ---
         // Style: WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON
-        bw.Write((uint)(0x40000000 | 0x10000000 | 0x00010000 | 0x00000000));
-        bw.Write((uint)0);
-        bw.Write((short)210); // x
-        bw.Write((short)65);  // y
-        bw.Write((short)70);  // cx
-        bw.Write((short)25);  // cy
-        bw.Write((ushort)Idcancel);
-        bw.Write((ushort)0xFFFF);
-        bw.Write((ushort)0x0080);
-        foreach (char c in "Cancel") bw.Write((short)c);
-        bw.Write((short)0);
-        bw.Write((ushort)0);
+        WriteControl(0x40000000 | 0x10000000 | 0x00010000,
+            0,
+            210, 65, 70, 25,
+            (ushort)Idcancel, 0x0080,
+            "Cancel");
 
-        // The entire template must be DWORD-aligned. Pad the final byte count up to a multiple of 4.
-        long length = ms.Length;
-        int pad = (int)(4 - (length % 4)) % 4;
-        for (int i = 0; i < pad; i++) bw.Write((byte)0);
+        // Final pad to DWORD (not strictly required but tidy)
+        PadToDword();
         return ms.ToArray();
     }
 
