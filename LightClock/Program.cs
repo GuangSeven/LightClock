@@ -402,11 +402,11 @@ internal static class Program
                     {
                         _timeFontName = name;
                         _timeFontPitchAndFamily = pitch;
-                        if (_timeFontHandle != IntPtr.Zero)
-                        {
-                            DeleteObject(_timeFontHandle);
-                            _timeFontHandle = IntPtr.Zero;
-                        }
+                        // IMPORTANT: must drop BOTH font handles. The date font uses the same
+                        // _timeFontName as the time font (see RenderAndPresent), so if we only
+                        // drop _timeFontHandle, the date font keeps the old face name forever.
+                        // This was the root cause of "date font only updates on app launch".
+                        DropCachedFonts();
                         RenderAndPresent(hwnd);
                         SaveSettings();
                     }
@@ -424,11 +424,9 @@ internal static class Program
                             // Use DEFAULT pitch/family so GDI picks the best match for the named font.
                             _timeFontName = trimmed;
                             _timeFontPitchAndFamily = PitchAndFamilySwiss;  // sensible default for sans-serif fonts
-                            if (_timeFontHandle != IntPtr.Zero)
-                            {
-                                DeleteObject(_timeFontHandle);
-                                _timeFontHandle = IntPtr.Zero;
-                            }
+                            // Drop BOTH font handles (date + time) so both get recreated with
+                            // the new face name on next render.
+                            DropCachedFonts();
                             RenderAndPresent(hwnd);
                             SaveSettings();
                         }
@@ -550,6 +548,25 @@ internal static class Program
         }
 
         return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+
+    /// <summary>
+    /// Drops both cached GDI font handles (date + time) so they get recreated with the current
+    /// _timeFontName on the next RenderAndPresent call. Call this whenever _timeFontName or
+    /// _timeFontPitchAndFamily changes — otherwise the date font keeps the old face name.
+    /// </summary>
+    private static void DropCachedFonts()
+    {
+        if (_dateFontHandle != IntPtr.Zero)
+        {
+            DeleteObject(_dateFontHandle);
+            _dateFontHandle = IntPtr.Zero;
+        }
+        if (_timeFontHandle != IntPtr.Zero)
+        {
+            DeleteObject(_timeFontHandle);
+            _timeFontHandle = IntPtr.Zero;
+        }
     }
 
     private static void Paint(IntPtr hwnd)
@@ -1335,39 +1352,99 @@ internal static class Program
     // ---- Wallpaper color extraction (Material You style) ----
 
     /// <summary>
-    /// Extracts the dominant color from the current desktop wallpaper and sets _textColor
-    /// to a lightened version of it (so the text remains readable on dark backgrounds).
+    /// Reads the Windows system accent color and sets _textColor to a lightened version of it.
+    ///
+    /// This replaces the previous wallpaper-image-extraction approach (WIC COM API) which was
+    /// fragile and never reliably worked. Instead, we use Windows' own "accent color" — the
+    /// same color that Windows 10/11 derives from the wallpaper (or that the user manually
+    /// picks in Settings → Personalization → Colors). This is the Material You-equivalent on
+    /// Windows: the OS already does the dominant-color extraction, so we just read its result.
+    ///
+    /// Source: HKCU\Software\Microsoft\Windows\DWM\AccentColor (REG_DWORD, 0xAABBGGRR format).
+    /// If the user hasn't customized the accent, Windows auto-derives it from the wallpaper.
+    /// Falls back to DwmGetColorizationColor (the "colorization color" used for window borders)
+    /// if the registry key is missing.
     /// </summary>
     private static void RefreshWallpaperColor()
     {
         try
         {
-            string? wallpaperPath = GetWallpaperPath();
-            if (string.IsNullOrEmpty(wallpaperPath) || !File.Exists(wallpaperPath))
+            uint accentColor = GetSystemAccentColor();
+            if (accentColor == 0)
             {
-                // No wallpaper file (e.g. solid color background). Fall back to default.
                 _textColor = DefaultTextColor;
                 return;
             }
 
-            // Always re-extract the color from the current wallpaper. This ensures that
-            // when the user changes their desktop wallpaper, the clock color updates
-            // accordingly (within the resample interval). We don't cache by path alone
-            // because the same path may point to different content over time (e.g. the
-            // user replaces the file, or Windows updates the TranscodedWallpaper cache).
+            // The accent color from the registry is in 0xAABBGGRR format (alpha in high byte).
+            // Extract RGB and ignore alpha — we always render fully opaque text.
+            byte b = (byte)((accentColor >> 16) & 0xFF);
+            byte g = (byte)((accentColor >> 8) & 0xFF);
+            byte r = (byte)(accentColor & 0xFF);
+            uint rgb = Rgb(r, g, b);
 
-            // Load the image, downsample to 64x64, compute the dominant color via a simple
-            // histogram-based algorithm (similar to Android's Monet extraction).
-            uint dominantColor = ExtractDominantColor(wallpaperPath);
-            // Lighten the dominant color so text is readable on any background.
-            // We convert to HSL, boost lightness to ~0.85, and convert back.
-            _textColor = LightenForText(dominantColor);
+            // Lighten the accent color so text is readable on dark/transparent backgrounds.
+            _textColor = LightenForText(rgb);
         }
         catch
         {
-            // Image loading failed — fall back to default.
             _textColor = DefaultTextColor;
         }
+    }
+
+    /// <summary>
+    /// Reads the Windows system accent color from the registry.
+    /// Tries HKCU\Software\Microsoft\Windows\DWM\AccentColor first (Windows 10+ accent color,
+    /// 0xAABBGGRR format). If that's missing or zero, falls back to DwmGetColorizationColor
+    /// (the DWM colorization color, also derived from the wallpaper, 0xAABBGGRR format).
+    /// Returns 0 if both fail.
+    /// </summary>
+    private static uint GetSystemAccentColor()
+    {
+        // Try the registry first — it's the most reliable source of the user's accent color.
+        try
+        {
+            const string DwmKey = "Software\\Microsoft\\Windows\\DWM";
+            const string AccentValue = "AccentColor";
+            int result = RegOpenKeyEx(HkeyCurrentUser, DwmKey, 0, 0x0019 /* KEY_READ */, out IntPtr hKey);
+            if (result == 0)
+            {
+                try
+                {
+                    // Read the REG_DWORD value.
+                    int type = 0;
+                    int dataSize = 4;
+                    byte[] data = new byte[4];
+                    int queryResult = RegQueryValueEx(hKey, AccentValue, IntPtr.Zero, ref type, data, ref dataSize);
+                    if (queryResult == 0 && type == 4 /* REG_DWORD */ && dataSize == 4)
+                    {
+                        uint color = (uint)(data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24));
+                        if (color != 0)
+                        {
+                            return color;
+                        }
+                    }
+                }
+                finally
+                {
+                    RegCloseKey(hKey);
+                }
+            }
+        }
+        catch { /* fall through to DWM API */ }
+
+        // Fallback: DwmGetColorizationColor — returns the color Windows uses for window borders
+        // (also derived from wallpaper). 0xAABBGGRR format.
+        try
+        {
+            if (DwmGetColorizationColor(out uint colorizationColor, out _))
+            {
+                return colorizationColor;
+            }
+        }
+        catch { /* give up */ }
+
+        return 0;
     }
 
     /// <summary>
@@ -2105,6 +2182,13 @@ internal static class Program
 
     [DllImport("advapi32.dll", SetLastError = true)]
     private static extern int RegCloseKey(IntPtr hKey);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "RegQueryValueExW")]
+    private static extern int RegQueryValueEx(IntPtr hKey, string lpValueName, IntPtr lpReserved, ref int lpType, byte[] lpData, ref int lpcbData);
+
+    [DllImport("dwmapi.dll", PreserveSig = false)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DwmGetColorizationColor(out uint pcrColorization, [MarshalAs(UnmanagedType.Bool)] out bool pfOpaqueBlend);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr GetDC(IntPtr hWnd);
