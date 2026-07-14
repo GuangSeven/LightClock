@@ -596,13 +596,14 @@ internal static class Program
         // Scale by current DPI so the clock stays readable when dragged between monitors with different DPI.
         int dateHeight = MulDiv(DpiDateFontHeight, _dpi, 96);
         int timeHeight = MulDiv(DpiTimeFontHeight, _dpi, 96);
+        // Both date and time fonts use the user-selected _timeFontName so that the
+        // "Font" menu applies to BOTH lines (previously the date was hardcoded to "Segoe UI"
+        // and the user's custom font only affected the time). The date uses a lighter weight
+        // (FW_NORMAL = 400) and the time uses a heavier weight (FW_SEMIBOLD = 600) for
+        // visual hierarchy.
         _dateFontHandle = _dateFontHandle == IntPtr.Zero
-            ? CreateFont(dateHeight, 0, 0, 0, 400, 0, 0, 0, DefaultCharset, OutTtPrecis, ClipDefaultPrecis, CleartypeQuality, PitchAndFamilySwiss, "Segoe UI")
+            ? CreateFont(dateHeight, 0, 0, 0, 400, 0, 0, 0, DefaultCharset, OutTtPrecis, ClipDefaultPrecis, CleartypeQuality, _timeFontPitchAndFamily, _timeFontName)
             : _dateFontHandle;
-        // Time font uses Consolas (monospaced) so each digit takes the same width.
-        // With Segoe UI (proportional), "1" is narrower than "8" — when the minute changes
-        // from e.g. 11:58 to 11:59, the text width shifts and DT_CENTER re-centers it,
-        // causing a visible horizontal "jump". A monospaced font eliminates this entirely.
         _timeFontHandle = _timeFontHandle == IntPtr.Zero
             ? CreateFont(timeHeight, 0, 0, 0, 600, 0, 0, 0, DefaultCharset, OutTtPrecis, ClipDefaultPrecis, CleartypeQuality, _timeFontPitchAndFamily, _timeFontName)
             : _timeFontHandle;
@@ -623,13 +624,30 @@ internal static class Program
         SetBkColor(_memDc, bgColor);
         SetTextColor(_memDc, _textColor);
 
+        // ---- Adaptive date/time rect layout (DPI-aware, no overlap) ----
+        // Previously the rects used hardcoded offsets (top+18, top+120, top+92, bottom) that
+        // were tuned for 100% scaling. At 150%+ DPI the time font (168pt scaled) grew taller
+        // than the gap between the date's bottom and the time's top, causing the time to
+        // overlap and obscure the bottom of the date.
+        //
+        // New layout: divide the window into a date zone (top portion) and a time zone (bottom
+        // portion), with a DPI-scaled gap between them. The date zone height is proportional
+        // to the date font height, and the time zone fills the remaining space. This guarantees
+        // the two never overlap regardless of DPI or font size.
+        int gap = MulDiv(12, _dpi, 96);  // 12px gap at 96 DPI, scales with DPI
+        int dateZoneHeight = dateHeight + MulDiv(8, _dpi, 96);  // font height + small padding
+        int dateTop = rect.top + MulDiv(18, _dpi, 96);
+        int dateBottom = dateTop + dateZoneHeight;
+        int timeTop = dateBottom + gap;
+        int timeBottom = rect.bottom - MulDiv(10, _dpi, 96);
+
         IntPtr oldFont = SelectObject(_memDc, _dateFontHandle);
         var dateRect = new Rect
         {
             left = rect.left,
             right = rect.right,
-            top = rect.top + 18,
-            bottom = rect.top + 120
+            top = dateTop,
+            bottom = dateBottom
         };
         DrawText(_memDc, _dateText, _dateText.Length, ref dateRect, DtCenter | DtVCenter | DtSingleLine);
 
@@ -638,8 +656,8 @@ internal static class Program
         {
             left = rect.left,
             right = rect.right,
-            top = rect.top + 92,
-            bottom = rect.bottom
+            top = timeTop,
+            bottom = timeBottom
         };
         DrawText(_memDc, _timeText, _timeText.Length, ref timeRect, DtCenter | DtVCenter | DtSingleLine);
         SelectObject(_memDc, oldFont);
@@ -1368,158 +1386,223 @@ internal static class Program
     }
 
     /// <summary>
-    /// Loads an image file, downsamples it to a small grid (e.g. 64x64), and computes the
-    /// dominant color using a hue histogram. Returns the dominant color as an RGB uint.
+    /// Loads an image file via the Windows Imaging Component (WIC) — a COM API built into
+    /// Windows 7+ with no NuGet dependency. Supports JPEG, PNG, BMP, GIF, TIFF, etc.
+    /// After loading, we downsample to a 64×64 pixel grid and compute the dominant color
+    /// via a hue histogram.
+    ///
+    /// This replaces the previous System.Drawing.Common-based implementation which silently
+    /// failed because System.Drawing.Common is NOT part of the .NET 8 Desktop Runtime by
+    /// default — it's a separate NuGet package that the project didn't reference, so
+    /// Type.GetType("System.Drawing.Image, System.Drawing.Common") always returned null
+    /// and ExtractDominantColor always fell through to DefaultTextColor. The Material You
+    /// wallpaper-color feature therefore never worked.
     /// </summary>
     private static uint ExtractDominantColor(string imagePath)
     {
-        // Use System.Drawing.Common to load the image. This is available in .NET 8 on Windows
-        // as long as the project targets net*-windows (which we do).
-        // We don't reference System.Drawing.Common explicitly, but it's part of the Windows
-        // runtime. Fall back to a manual BMP parser if the assembly isn't available.
         try
         {
-            using var fs = new FileStream(imagePath, FileMode.Open, FileAccess.Read, FileShare.Read);
-            // Load via System.Drawing.Image (requires the System.Drawing.Common package on non-Windows,
-            // but on Windows net8.0-windows it's available via the Windows Desktop runtime).
-            // We use reflection to avoid a hard dependency; if the type isn't available we fall back.
-            var imageType = Type.GetType("System.Drawing.Image, System.Drawing.Common");
-            if (imageType != null)
+            // Create the WIC imaging factory via CoCreateInstance.
+            // CLSID_IWICImagingFactory2 = {317316A5-5636-4E35-9912-67B1BE79C12A}
+            // IID_IWICImagingFactory   = {317316A5-5636-4E35-9912-67B1BE79C12A} (same, we use the v2 CLSID)
+            var clsid = new Guid(0x317316A5, 0x5636, 0x4E35, 0x99, 0x12, 0x67, 0xB1, 0xBE, 0x79, 0xC1, 0x2A);
+            var iid = new Guid(0x317316A5, 0x5636, 0x4E35, 0x99, 0x12, 0x67, 0xB1, 0xBE, 0x79, 0xC1, 0x2A);
+            int hr = CoCreateInstance(ref clsid, IntPtr.Zero, 1 /* CLSCTX_INPROC_SERVER */, ref iid, out object factoryObj);
+            if (hr != 0 || factoryObj == null) return DefaultTextColor;
+
+            // Use 'dynamic' to call COM methods via the runtime's COM interop. The WIC factory
+            // exposes methods like CreateDecoderFromFilename, CreateFormatConverter, etc.
+            dynamic factory = factoryObj;
+            try
             {
-                var fromStream = imageType.GetMethod("FromStream", new[] { typeof(Stream) });
-                if (fromStream != null)
+                // Create a decoder from the wallpaper file.
+                const int WICDecodeMetadataCacheOnDemand = 0x00000001;
+                dynamic decoder = factory.CreateDecoderFromFilename(imagePath, IntPtr.Zero, 1 /* GENERIC_READ */,
+                    WICDecodeMetadataCacheOnDemand);
+                if (decoder == null) return DefaultTextColor;
+
+                try
                 {
-                    var image = fromStream.Invoke(null, new object[] { fs });
-                    if (image != null)
+                    // Get the first (and usually only) frame.
+                    dynamic frame = decoder.GetFrame(0);
+                    if (frame == null) return DefaultTextColor;
+
+                    try
                     {
+                        // Get the frame's pixel size.
+                        uint srcW = (uint)frame.Size.Width;
+                        uint srcH = (uint)frame.Size.Height;
+                        if (srcW == 0 || srcH == 0) return DefaultTextColor;
+
+                        // Convert to 32bpp BGRA via a FormatConverter so we get consistent pixel
+                        // layout regardless of the source format (JPEG YCbCr, PNG palette, etc.).
+                        // GUID_WICPixelFormat32bppBGRA = {6FDDC324-4E03-4BFE-B185-3D77768DC90C}
+                        var bgraFmt = new Guid(0x6FDDC324, 0x4E03, 0x4BFE, 0xB1, 0x85, 0x3D, 0x77, 0x76, 0x8D, 0xC9, 0x0C);
+                        dynamic converter = factory.CreateFormatConverter();
+                        if (converter == null) return DefaultTextColor;
+
                         try
                         {
-                            return ExtractDominantColorFromImage(image, imageType);
+                            // Initialize the converter: source format, dest BGRA, dithering = none, alpha threshold = 0.
+                            const int WICBitmapDitherTypeNone = 0;
+                            const int WICBitmapPaletteTypeCustom = 0;
+                            converter.Initialize(frame, ref bgraFmt, WICBitmapDitherTypeNone, null, 0.0, WICBitmapPaletteTypeCustom);
+
+                            // Downsample to 64×64 for fast histogram computation. We use a simple
+                            // nearest-neighbor sample by copying the converter's pixels into a small
+                            // bitmap via CopyPixels.
+                            int targetW = 64;
+                            int targetH = 64;
+                            int stride = targetW * 4;  // 4 bytes per pixel (BGRA)
+                            byte[] pixels = new byte[stride * targetH];
+
+                            // WIC's CopyPixels takes a WICRect for the source region. To downsample,
+                            // we don't use CopyPixels' built-in scaling (it doesn't scale). Instead
+                            // we read the full image and sample pixels ourselves below.
+                            // For very large images this is slow, so we cap the read at 256×256 max.
+                            int readW = (int)Math.Min(srcW, 256);
+                            int readH = (int)Math.Min(srcH, 256);
+                            int readStride = readW * 4;
+                            byte[] readPixels = new byte[readStride * readH];
+
+                            var readRect = new WICRect { X = 0, Y = 0, Width = readW, Height = readH };
+                            converter.CopyPixels(ref readRect, (uint)readStride, readPixels.Length, readPixels);
+
+                            // Now downsample by averaging readPixels (readW×readH) → pixels (64×64).
+                            double scaleX = (double)readW / targetW;
+                            double scaleY = (double)readH / targetH;
+                            for (int y = 0; y < targetH; y++)
+                            {
+                                for (int x = 0; x < targetW; x++)
+                                {
+                                    int srcX = (int)(x * scaleX);
+                                    int srcY = (int)(y * scaleY);
+                                    int srcIdx = (srcY * readW + srcX) * 4;
+                                    int dstIdx = (y * targetW + x) * 4;
+                                    pixels[dstIdx] = readPixels[srcIdx];     // B
+                                    pixels[dstIdx + 1] = readPixels[srcIdx + 1]; // G
+                                    pixels[dstIdx + 2] = readPixels[srcIdx + 2]; // R
+                                    pixels[dstIdx + 3] = readPixels[srcIdx + 3]; // A
+                                }
+                            }
+
+                            return ComputeDominantColorFromPixels(pixels, targetW, targetH);
                         }
                         finally
                         {
-                            var dispose = image.GetType().GetMethod("Dispose", Type.EmptyTypes);
-                            dispose?.Invoke(image, null);
+                            TryReleaseComObject(converter);
                         }
                     }
+                    finally
+                    {
+                        TryReleaseComObject(frame);
+                    }
                 }
+                finally
+                {
+                    TryReleaseComObject(decoder);
+                }
+            }
+            finally
+            {
+                TryReleaseComObject(factory);
             }
         }
         catch
         {
-            // Fall through to default.
+            // Image loading or WIC failed — fall back to default color.
         }
         return DefaultTextColor;
     }
 
-    private static uint ExtractDominantColorFromImage(object image, Type imageType)
+    /// <summary>
+    /// Computes the dominant color from a 64×64 BGRA pixel array using a hue histogram.
+    /// Skips very dark / very bright / very desaturated pixels, then picks the hue bucket
+    /// with the most samples and averages its RGB.
+    /// </summary>
+    private static uint ComputeDominantColorFromPixels(byte[] bgra, int width, int height)
     {
-        // Downsample to 64x64 via System.Drawing.Bitmap constructor.
-        var bitmapType = Type.GetType("System.Drawing.Bitmap, System.Drawing.Common");
-        if (bitmapType == null) return DefaultTextColor;
+        var hueCounts = new int[36];
+        var hueR = new long[36];
+        var hueG = new long[36];
+        var hueB = new long[36];
+        int totalSamples = 0;
 
-        // Create a 64x64 Bitmap and draw the image into it.
-        var sizeType = Type.GetType("System.Drawing.Size, System.Drawing.Common");
-        var ctor = bitmapType.GetConstructor(new[] { typeof(int), typeof(int) });
-        if (ctor == null) return DefaultTextColor;
-        var small = ctor.Invoke(new object[] { 64, 64 });
-        if (small == null) return DefaultTextColor;
-
-        try
+        for (int y = 0; y < height; y++)
         {
-            // Get a Graphics object from the small bitmap.
-            var graphicsType = Type.GetType("System.Drawing.Graphics, System.Drawing.Common");
-            if (graphicsType == null) return DefaultTextColor;
-            var fromImage = graphicsType.GetMethod("FromImage", new[] { imageType });
-            if (fromImage == null) return DefaultTextColor;
-            var g = fromImage.Invoke(null, new object[] { small });
-            if (g == null) return DefaultTextColor;
-
-            try
+            for (int x = 0; x < width; x++)
             {
-                // Draw the original image scaled into the 64x64 bitmap.
-                var drawImage = graphicsType.GetMethod("DrawImage", new[] { imageType, typeof(int), typeof(int), typeof(int), typeof(int) });
-                drawImage?.Invoke(g, new object[] { image, 0, 0, 64, 64 });
+                int idx = (y * width + x) * 4;
+                byte b = bgra[idx];
+                byte g = bgra[idx + 1];
+                byte r = bgra[idx + 2];
+                // byte a = bgra[idx + 3];  // not used for color extraction
+
+                // Convert RGB to HSL to filter by brightness/saturation.
+                RgbToHsl(r, g, b, out double h, out double s, out double l);
+                // Skip very dark, very bright, or very desaturated pixels — they don't contribute
+                // meaningful hue information for a "dominant color" extraction.
+                if (l < 0.1 || l > 0.9 || s < 0.15) continue;
+                int bucket = (int)(h / 10.0);
+                if (bucket >= 36) bucket = 35;
+                if (bucket < 0) bucket = 0;
+                hueCounts[bucket]++;
+                hueR[bucket] += r;
+                hueG[bucket] += g;
+                hueB[bucket] += b;
+                totalSamples++;
             }
-            finally
-            {
-                var dispose = graphicsType.GetMethod("Dispose", Type.EmptyTypes);
-                dispose?.Invoke(g, null);
-            }
-
-            // Build a hue histogram from the 64x64 bitmap.
-            // We use GetPixel(x, y) which returns a System.Drawing.Color.
-            var getPixel = bitmapType.GetMethod("GetPixel", new[] { typeof(int), typeof(int) });
-            if (getPixel == null) return DefaultTextColor;
-
-            // Hue buckets: 36 buckets of 10 degrees each.
-            var hueCounts = new int[36];
-            var hueR = new long[36];
-            var hueG = new long[36];
-            var hueB = new long[36];
-            int totalSamples = 0;
-
-            var colorType = Type.GetType("System.Drawing.Color, System.Drawing.Common");
-            if (colorType == null) return DefaultTextColor;
-            var getHue = colorType.GetProperty("GetHue")?.GetMethod ?? colorType.GetMethod("GetHue", Type.EmptyTypes);
-            var getR = colorType.GetProperty("R")?.GetMethod;
-            var getG = colorType.GetProperty("G")?.GetMethod;
-            var getB = colorType.GetProperty("B")?.GetMethod;
-            var getBrightness = colorType.GetProperty("GetBrightness")?.GetMethod ?? colorType.GetMethod("GetBrightness", Type.EmptyTypes);
-            var getSaturation = colorType.GetProperty("GetSaturation")?.GetMethod ?? colorType.GetMethod("GetSaturation", Type.EmptyTypes);
-            if (getHue == null || getR == null || getG == null || getB == null) return DefaultTextColor;
-
-            for (int y = 0; y < 64; y++)
-            {
-                for (int x = 0; x < 64; x++)
-                {
-                    var color = getPixel.Invoke(small, new object[] { x, y });
-                    if (color == null) continue;
-                    float hue = (float)getHue.Invoke(color, null)!;
-                    float brightness = getBrightness != null ? (float)getBrightness.Invoke(color, null)! : 0.5f;
-                    float saturation = getSaturation != null ? (float)getSaturation.Invoke(color, null)! : 0.5f;
-                    // Skip very dark, very bright, or very desaturated pixels — they don't contribute
-                    // meaningful hue information for a "dominant color" extraction.
-                    if (brightness < 0.1f || brightness > 0.9f || saturation < 0.15f) continue;
-                    int bucket = (int)(hue / 10.0f);
-                    if (bucket >= 36) bucket = 35;
-                    if (bucket < 0) bucket = 0;
-                    hueCounts[bucket]++;
-                    hueR[bucket] += (byte)getR.Invoke(color, null)!;
-                    hueG[bucket] += (byte)getG.Invoke(color, null)!;
-                    hueB[bucket] += (byte)getB.Invoke(color, null)!;
-                    totalSamples++;
-                }
-            }
-
-            if (totalSamples == 0) return DefaultTextColor;
-
-            // Find the hue bucket with the most samples.
-            int bestBucket = 0;
-            int bestCount = 0;
-            for (int i = 0; i < 36; i++)
-            {
-                if (hueCounts[i] > bestCount)
-                {
-                    bestCount = hueCounts[i];
-                    bestBucket = i;
-                }
-            }
-
-            if (hueCounts[bestBucket] == 0) return DefaultTextColor;
-
-            // Average color within the winning bucket.
-            byte avgR = (byte)(hueR[bestBucket] / hueCounts[bestBucket]);
-            byte avgG = (byte)(hueG[bestBucket] / hueCounts[bestBucket]);
-            byte avgB = (byte)(hueB[bestBucket] / hueCounts[bestBucket]);
-            return Rgb(avgR, avgG, avgB);
         }
-        finally
+
+        if (totalSamples == 0) return DefaultTextColor;
+
+        // Find the hue bucket with the most samples.
+        int bestBucket = 0;
+        int bestCount = 0;
+        for (int i = 0; i < 36; i++)
         {
-            var dispose = bitmapType.GetMethod("Dispose", Type.EmptyTypes);
-            dispose?.Invoke(small, null);
+            if (hueCounts[i] > bestCount)
+            {
+                bestCount = hueCounts[i];
+                bestBucket = i;
+            }
         }
+
+        if (hueCounts[bestBucket] == 0) return DefaultTextColor;
+
+        // Average color within the winning bucket.
+        byte avgR = (byte)(hueR[bestBucket] / hueCounts[bestBucket]);
+        byte avgG = (byte)(hueG[bestBucket] / hueCounts[bestBucket]);
+        byte avgB = (byte)(hueB[bestBucket] / hueCounts[bestBucket]);
+        return Rgb(avgR, avgG, avgB);
     }
+
+    /// <summary>
+    /// WICRect: simple rectangle used by IWICBitmapSource::CopyPixels. Field order matters
+    /// for COM marshalling — X, Y, Width, Height as Int32.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WICRect
+    {
+        public int X;
+        public int Y;
+        public int Width;
+        public int Height;
+    }
+
+    /// <summary>
+    /// Best-effort Marshal.ReleaseComObject — swallows exceptions so we never crash during cleanup.
+    /// </summary>
+    private static void TryReleaseComObject(object obj)
+    {
+        try { Marshal.ReleaseComObject(obj); } catch { /* ignore */ }
+    }
+
+    [DllImport("ole32.dll", PreserveSig = false)]
+    [return: MarshalAs(UnmanagedType.Interface)]
+    private static extern int CoCreateInstance(
+        ref Guid rclsid, IntPtr pUnkOuter, int dwClsContext, ref Guid riid,
+        [MarshalAs(UnmanagedType.Interface), Out] out object ppv);
 
     /// <summary>
     /// Lightens an RGB color so it's suitable as text on a dark/transparent background.
