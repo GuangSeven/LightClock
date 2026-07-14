@@ -85,7 +85,8 @@ jobs:
         run: |
           Get-ChildItem -Path .\artifacts -Directory | ForEach-Object {
             $zip = ".\$($_.Name).zip"
-            Compress-Archive -Path $_.FullName\* -DestinationPath $zip
+            $source = Join-Path $_.FullName "*"
+            Compress-Archive -Path $source -DestinationPath $zip
           }
 
       - name: Publish GitHub Release
