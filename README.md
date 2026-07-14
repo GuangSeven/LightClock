@@ -2,7 +2,7 @@
 
 A lightweight transparent desktop clock overlay for Windows 10/11, built with Win32 API + GDI. Single C# file, no UI framework.
 
-![LightClock preview](docs/preview.png)
+![LightClock preview](https://edgeoneimg.cdn1.vip/i/6a561b4fe4125_1784027983.webp)
 
 ---
 
