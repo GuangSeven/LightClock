@@ -117,8 +117,9 @@ internal static class Program
     // Whether to launch LightClock at Windows startup (HKCU Run key).
     private static bool _autoStart = false;
 
-    // Whether to extract text color from the current desktop wallpaper (Material You style).
-    // When enabled, _textColor is recomputed periodically from the wallpaper image.
+    // Whether to use the Windows system accent color as the clock text color.
+    // When enabled, _textColor is read from HKCU\Software\Microsoft\Windows\DWM\AccentColor
+    // (the same color Windows derives from the wallpaper or that the user picks in Settings).
     private static bool _useWallpaperColor = false;
 
     // Path to the persistent settings file: %APPDATA%/LightClock/settings.json
@@ -969,8 +970,8 @@ internal static class Program
             // Start with Windows (toggle)
             AppendMenu(menu, MfString | (_autoStart ? MfChecked : MfUnchecked), (IntPtr)CmdToggleAutoStart, "Start with Windows");
 
-            // Wallpaper color (toggle) - Material You style text color extraction
-            AppendMenu(menu, MfString | (_useWallpaperColor ? MfChecked : MfUnchecked), (IntPtr)CmdToggleWallpaperColor, "Wallpaper Color");
+            // Accent Color (toggle) — use Windows system accent color as clock text color
+            AppendMenu(menu, MfString | (_useWallpaperColor ? MfChecked : MfUnchecked), (IntPtr)CmdToggleWallpaperColor, "Accent Color");
 
             // Exit
             AppendMenu(menu, MfSeparator, IntPtr.Zero, null);
