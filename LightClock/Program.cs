@@ -66,7 +66,12 @@ internal static class Program
     private const int CmdFontMicrosoftYaHei = 1013;
     private const int CmdFontCustom = 1014;  // opens an input dialog
     private const int CmdToggleAutoStart = 1020;
-    private const int CmdToggleWallpaperColor = 1030;  // toggle Material-You-style wallpaper color extraction
+    private const int CmdToggleAccentColor = 1030;
+    private const int CmdToggleShadow = 1040;
+    private const int CmdShadowOff = 1041;
+    private const int CmdShadowSmall = 1042;
+    private const int CmdShadowMedium = 1043;
+    private const int CmdShadowLarge = 1044;
 
     private const int WmCreate = 0x0001;
     private const int WmDestroy = 0x0002;
@@ -81,6 +86,8 @@ internal static class Program
     private const int WmDpiChanged = 0x02E0;
     private const int WmDisplayChange = 0x007E;
     private const int WmWindowPosChanging = 0x0046;
+    private const int WmMove = 0x0003;
+    private const int WmSize = 0x0005;
 
     private const int HtCaption = 2;
 
@@ -122,6 +129,10 @@ internal static class Program
     // (the same color Windows derives from the wallpaper or that the user picks in Settings).
     private static bool _useWallpaperColor = false;
 
+    // Shadow intensity: 0 = off, 1 = small (2px), 2 = medium (4px), 3 = large (6px).
+    // Shadow is rendered by drawing the text offset in a dark color before the main text.
+    private static int _shadowLevel = 0;
+
     // Path to the persistent settings file: %APPDATA%/LightClock/settings.json
     // Lazily computed because Environment.GetFolderPath isn't available on all targets.
     private static string? _settingsPath;
@@ -160,6 +171,11 @@ internal static class Program
 
     private const int DpiDateFontHeight = 56;
     private const int DpiTimeFontHeight = 168;
+
+    // Persisted window position (in screen coords). Loaded from settings.json on startup;
+    // saved whenever the window is moved (WM_WINDOWPOSCHANGED → WM_MOVE).
+    private static int _savedWindowX = -1;
+    private static int _savedWindowY = -1;
 
     // Wallpaper color re-sampling interval. We don't re-extract every second (too expensive);
     // instead we sample once on startup and re-sample when this many timer ticks have elapsed.
@@ -240,11 +256,20 @@ internal static class Program
 
         var x = 0;
         var y = 0;
-        var workArea = new Rect();
-        if (SystemParametersInfo(SpiGetWorkArea, 0, ref workArea, 0))
+        // Use saved window position if available; otherwise center on the work area.
+        if (_savedWindowX >= 0 && _savedWindowY >= 0)
         {
-            x = workArea.left + Math.Max(0, ((workArea.right - workArea.left) - WindowWidth) / 2);
-            y = workArea.top + 40;
+            x = _savedWindowX;
+            y = _savedWindowY;
+        }
+        else
+        {
+            var workArea = new Rect();
+            if (SystemParametersInfo(SpiGetWorkArea, 0, ref workArea, 0))
+            {
+                x = workArea.left + Math.Max(0, ((workArea.right - workArea.left) - WindowWidth) / 2);
+                y = workArea.top + 40;
+            }
         }
 
         IntPtr hwnd = CreateWindowEx(
@@ -362,6 +387,7 @@ internal static class Program
                         0,
                         0,
                         SwpNomove | SwpNosize | SwpShowWindow);
+                    SaveSettings();  // persist the toggle so it survives restart
                 }
                 else if (commandId == CmdExit)
                 {
@@ -446,7 +472,7 @@ internal static class Program
                     SetAutoStart(_autoStart);
                     SaveSettings();
                 }
-                else if (commandId == CmdToggleWallpaperColor)
+                else if (commandId == CmdToggleAccentColor)
                 {
                     _useWallpaperColor = !_useWallpaperColor;
                     if (_useWallpaperColor)
@@ -462,6 +488,24 @@ internal static class Program
                     }
                     RenderAndPresent(hwnd);
                     SaveSettings();
+                }
+                else if (commandId == CmdShadowOff || commandId == CmdShadowSmall ||
+                         commandId == CmdShadowMedium || commandId == CmdShadowLarge)
+                {
+                    int newLevel = commandId switch
+                    {
+                        CmdShadowOff => 0,
+                        CmdShadowSmall => 1,
+                        CmdShadowMedium => 2,
+                        CmdShadowLarge => 3,
+                        _ => 0
+                    };
+                    if (_shadowLevel != newLevel)
+                    {
+                        _shadowLevel = newLevel;
+                        RenderAndPresent(hwnd);
+                        SaveSettings();
+                    }
                 }
                 return IntPtr.Zero;
 
@@ -541,6 +585,22 @@ internal static class Program
                     }
                 }
                 break;  // fall through to DefWindowProc
+
+            case WmMove:
+                // Save the window's new position so it can be restored on next launch.
+                // lParam contains the new position: LOWORD = x, HIWORD = y (screen coords).
+                if (_windowReady)
+                {
+                    int x = (short)((uint)(long)lParam & 0xFFFF);
+                    int y = (short)(((uint)(long)lParam >> 16) & 0xFFFF);
+                    if (x != _savedWindowX || y != _savedWindowY)
+                    {
+                        _savedWindowX = x;
+                        _savedWindowY = y;
+                        SaveSettings();
+                    }
+                }
+                return IntPtr.Zero;
 
             case WmDestroy:
                 KillTimer(hwnd, TimerId);
@@ -638,28 +698,34 @@ internal static class Program
         //     -> set alpha = 255 and un-blend the magenta out of the RGB to recover the true
         //     text color. This gives smooth anti-aliased edges with proper per-pixel alpha.
         uint bgColor = Rgb(255, 0, 255);  // magenta sentinel
-        SetBkMode(_memDc, OpaqueBkMode);
-        SetBkColor(_memDc, bgColor);
-        SetTextColor(_memDc, _textColor);
+
+        // Shadow offset in pixels, scaled by DPI. Level 0 = no shadow.
+        int shadowOffset = _shadowLevel switch
+        {
+            1 => Math.Max(1, MulDiv(2, _dpi, 96)),
+            2 => Math.Max(2, MulDiv(4, _dpi, 96)),
+            3 => Math.Max(3, MulDiv(6, _dpi, 96)),
+            _ => 0
+        };
+        // Shadow color: dark version of the text color. We darken by 70% so the shadow is
+        // visible but not pure black (which would look harsh on bright backgrounds).
+        uint shadowColor = DarkenColor(_textColor, 0.7);
 
         // ---- Adaptive date/time rect layout (DPI-aware, no overlap) ----
-        // Previously the rects used hardcoded offsets (top+18, top+120, top+92, bottom) that
-        // were tuned for 100% scaling. At 150%+ DPI the time font (168pt scaled) grew taller
-        // than the gap between the date's bottom and the time's top, causing the time to
-        // overlap and obscure the bottom of the date.
-        //
-        // New layout: divide the window into a date zone (top portion) and a time zone (bottom
-        // portion), with a DPI-scaled gap between them. The date zone height is proportional
-        // to the date font height, and the time zone fills the remaining space. This guarantees
-        // the two never overlap regardless of DPI or font size.
-        int gap = MulDiv(12, _dpi, 96);  // 12px gap at 96 DPI, scales with DPI
-        int dateZoneHeight = dateHeight + MulDiv(8, _dpi, 96);  // font height + small padding
+        int gap = MulDiv(12, _dpi, 96);
+        int dateZoneHeight = dateHeight + MulDiv(8, _dpi, 96);
         int dateTop = rect.top + MulDiv(18, _dpi, 96);
         int dateBottom = dateTop + dateZoneHeight;
         int timeTop = dateBottom + gap;
         int timeBottom = rect.bottom - MulDiv(10, _dpi, 96);
 
-        IntPtr oldFont = SelectObject(_memDc, _dateFontHandle);
+        // ---- Pass 1: Fill background with magenta (OPAQUE mode) ----
+        SetBkMode(_memDc, OpaqueBkMode);
+        SetBkColor(_memDc, bgColor);
+        using var bgBrush = new GdiObject(CreateSolidBrush(bgColor));
+        FillRect(_memDc, ref rect, bgBrush.Handle);
+
+        // Declare rects up here so both shadow and main-text passes can use them.
         var dateRect = new Rect
         {
             left = rect.left,
@@ -667,9 +733,6 @@ internal static class Program
             top = dateTop,
             bottom = dateBottom
         };
-        DrawText(_memDc, _dateText, _dateText.Length, ref dateRect, DtCenter | DtVCenter | DtSingleLine);
-
-        SelectObject(_memDc, _timeFontHandle);
         var timeRect = new Rect
         {
             left = rect.left,
@@ -677,6 +740,43 @@ internal static class Program
             top = timeTop,
             bottom = timeBottom
         };
+
+        // ---- Pass 2: Draw shadow (if enabled) ----
+        if (shadowOffset > 0)
+        {
+            SetBkMode(_memDc, TransparentBkMode);
+            SetTextColor(_memDc, shadowColor);
+
+            IntPtr oldFont2 = SelectObject(_memDc, _dateFontHandle);
+            var shadowDateRect = new Rect
+            {
+                left = dateRect.left + shadowOffset,
+                right = dateRect.right + shadowOffset,
+                top = dateTop + shadowOffset,
+                bottom = dateBottom + shadowOffset
+            };
+            DrawText(_memDc, _dateText, _dateText.Length, ref shadowDateRect, DtCenter | DtVCenter | DtSingleLine);
+
+            SelectObject(_memDc, _timeFontHandle);
+            var shadowTimeRect = new Rect
+            {
+                left = timeRect.left + shadowOffset,
+                right = timeRect.right + shadowOffset,
+                top = timeTop + shadowOffset,
+                bottom = timeBottom + shadowOffset
+            };
+            DrawText(_memDc, _timeText, _timeText.Length, ref shadowTimeRect, DtCenter | DtVCenter | DtSingleLine);
+            SelectObject(_memDc, oldFont2);
+        }
+
+        // ---- Pass 3: Draw main text on top (TRANSPARENT mode so it doesn't overwrite shadow) ----
+        SetBkMode(_memDc, TransparentBkMode);
+        SetTextColor(_memDc, _textColor);
+
+        IntPtr oldFont = SelectObject(_memDc, _dateFontHandle);
+        DrawText(_memDc, _dateText, _dateText.Length, ref dateRect, DtCenter | DtVCenter | DtSingleLine);
+
+        SelectObject(_memDc, _timeFontHandle);
         DrawText(_memDc, _timeText, _timeText.Length, ref timeRect, DtCenter | DtVCenter | DtSingleLine);
         SelectObject(_memDc, oldFont);
 
@@ -971,7 +1071,15 @@ internal static class Program
             AppendMenu(menu, MfString | (_autoStart ? MfChecked : MfUnchecked), (IntPtr)CmdToggleAutoStart, "Start with Windows");
 
             // Accent Color (toggle) — use Windows system accent color as clock text color
-            AppendMenu(menu, MfString | (_useWallpaperColor ? MfChecked : MfUnchecked), (IntPtr)CmdToggleWallpaperColor, "Accent Color");
+            AppendMenu(menu, MfString | (_useWallpaperColor ? MfChecked : MfUnchecked), (IntPtr)CmdToggleAccentColor, "Accent Color");
+
+            // Shadow submenu — text shadow intensity
+            IntPtr shadowMenu = CreatePopupMenu();
+            AppendMenu(shadowMenu, MfString | (_shadowLevel == 0 ? MfChecked : MfUnchecked), (IntPtr)CmdShadowOff, "Off");
+            AppendMenu(shadowMenu, MfString | (_shadowLevel == 1 ? MfChecked : MfUnchecked), (IntPtr)CmdShadowSmall, "Small");
+            AppendMenu(shadowMenu, MfString | (_shadowLevel == 2 ? MfChecked : MfUnchecked), (IntPtr)CmdShadowMedium, "Medium");
+            AppendMenu(shadowMenu, MfString | (_shadowLevel == 3 ? MfChecked : MfUnchecked), (IntPtr)CmdShadowLarge, "Large");
+            AppendMenu(menu, MfString | 0x0010 /* MF_POPUP */, shadowMenu, "Shadow");
 
             // Exit
             AppendMenu(menu, MfSeparator, IntPtr.Zero, null);
@@ -1051,6 +1159,20 @@ internal static class Program
         => (int)(((long)nNumber * nNumerator) / nDenominator);
 
     private static uint Rgb(byte r, byte g, byte b) => (uint)(r | (g << 8) | (b << 16));
+
+    /// <summary>
+    /// Darkens an RGB color by the given factor (0.0 = black, 1.0 = unchanged).
+    /// </summary>
+    private static uint DarkenColor(uint color, double factor)
+    {
+        byte r = (byte)(color & 0xFF);
+        byte g = (byte)((color >> 8) & 0xFF);
+        byte b = (byte)((color >> 16) & 0xFF);
+        r = (byte)(r * factor);
+        g = (byte)(g * factor);
+        b = (byte)(b * factor);
+        return Rgb(r, g, b);
+    }
 
     // ---- Custom font input dialog + font availability check ----
 
@@ -1795,6 +1917,23 @@ internal static class Program
                 // Sample the wallpaper now so the first render uses the extracted color.
                 RefreshWallpaperColor();
             }
+            if (root.TryGetProperty("shadowLevel", out var shadowEl) && shadowEl.ValueKind == System.Text.Json.JsonValueKind.Number)
+            {
+                int level = shadowEl.GetInt32();
+                if (level >= 0 && level <= 3) _shadowLevel = level;
+            }
+            if (root.TryGetProperty("alwaysOnTop", out var topEl) && topEl.ValueKind == System.Text.Json.JsonValueKind.False)
+            {
+                _alwaysOnTop = false;
+            }
+            if (root.TryGetProperty("windowX", out var xEl) && xEl.ValueKind == System.Text.Json.JsonValueKind.Number)
+            {
+                _savedWindowX = xEl.GetInt32();
+            }
+            if (root.TryGetProperty("windowY", out var yEl) && yEl.ValueKind == System.Text.Json.JsonValueKind.Number)
+            {
+                _savedWindowY = yEl.GetInt32();
+            }
             // Sync the registry entry with the loaded preference. If the user previously enabled
             // auto-start from the menu but later removed the entry manually (or via Task Manager),
             // we re-create it so the menu checkmark stays consistent with reality.
@@ -1816,7 +1955,11 @@ internal static class Program
                 ["language"] = _language,
                 ["timeFont"] = _timeFontName,
                 ["autoStart"] = _autoStart,
-                ["useWallpaperColor"] = _useWallpaperColor
+                ["useWallpaperColor"] = _useWallpaperColor,
+                ["shadowLevel"] = _shadowLevel,
+                ["alwaysOnTop"] = _alwaysOnTop,
+                ["windowX"] = _savedWindowX,
+                ["windowY"] = _savedWindowY
             };
             string json = System.Text.Json.JsonSerializer.Serialize(obj, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(path, json);
