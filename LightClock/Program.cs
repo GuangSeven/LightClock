@@ -87,7 +87,6 @@ internal static class Program
     private const int WmDisplayChange = 0x007E;
     private const int WmWindowPosChanging = 0x0046;
     private const int WmMove = 0x0003;
-    private const int WmSize = 0x0005;
 
     private const int HtCaption = 2;
 
@@ -127,7 +126,7 @@ internal static class Program
     // Whether to use the Windows system accent color as the clock text color.
     // When enabled, _textColor is read from HKCU\Software\Microsoft\Windows\DWM\AccentColor
     // (the same color Windows derives from the wallpaper or that the user picks in Settings).
-    private static bool _useWallpaperColor = false;
+    private static bool _useAccentColor = false;
 
     // Shadow intensity: 0 = off, 1 = small (2px), 2 = medium (4px), 3 = large (6px).
     // Shadow is rendered by drawing the text offset in a dark color before the main text.
@@ -173,9 +172,11 @@ internal static class Program
     private const int DpiTimeFontHeight = 168;
 
     // Persisted window position (in screen coords). Loaded from settings.json on startup;
-    // saved whenever the window is moved (WM_WINDOWPOSCHANGED → WM_MOVE).
-    private static int _savedWindowX = -1;
-    private static int _savedWindowY = -1;
+    // saved whenever the window moves (WM_MOVE, fired by DefWindowProc on WM_WINDOWPOSCHANGED).
+    // Uses int.MinValue as sentinel for 'no saved position' so negative coords (multi-monitor)
+    // are not falsely rejected.
+    private static int _savedWindowX = int.MinValue;
+    private static int _savedWindowY = int.MinValue;
 
     // Wallpaper color re-sampling interval. We don't re-extract every second (too expensive);
     // instead we sample once on startup and re-sample when this many timer ticks have elapsed.
@@ -257,7 +258,9 @@ internal static class Program
         var x = 0;
         var y = 0;
         // Use saved window position if available; otherwise center on the work area.
-        if (_savedWindowX >= 0 && _savedWindowY >= 0)
+        // int.MinValue is the sentinel for 'no saved position' — allows negative coords
+        // (e.g. secondary monitor to the left of primary) to be restored correctly.
+        if (_savedWindowX != int.MinValue && _savedWindowY != int.MinValue)
         {
             x = _savedWindowX;
             y = _savedWindowY;
@@ -344,7 +347,7 @@ internal static class Program
                     UpdateClockText();
                     // Periodically re-sample the wallpaper color (every WallpaperResampleIntervalTicks
                     // seconds) so the clock adapts when the user changes their wallpaper.
-                    if (_useWallpaperColor)
+                    if (_useAccentColor)
                     {
                         _wallpaperResampleCounter++;
                         if (_wallpaperResampleCounter >= WallpaperResampleIntervalTicks)
@@ -474,8 +477,8 @@ internal static class Program
                 }
                 else if (commandId == CmdToggleAccentColor)
                 {
-                    _useWallpaperColor = !_useWallpaperColor;
-                    if (_useWallpaperColor)
+                    _useAccentColor = !_useAccentColor;
+                    if (_useAccentColor)
                     {
                         // Immediately sample the wallpaper so the color change is visible.
                         RefreshWallpaperColor();
@@ -707,9 +710,11 @@ internal static class Program
             3 => Math.Max(3, MulDiv(6, _dpi, 96)),
             _ => 0
         };
-        // Shadow color: dark version of the text color. We darken by 70% so the shadow is
-        // visible but not pure black (which would look harsh on bright backgrounds).
-        uint shadowColor = DarkenColor(_textColor, 0.7);
+        // Shadow color: a fixed very-dark gray rather than a darkened version of the text
+        // color. Darkening the text color produces a mid-gray for bright text (e.g. white →
+        // 178,178,178) which reads as ghost text, not a shadow. A fixed dark color ensures
+        // the shadow is always darker than the surrounding pixels regardless of text color.
+        uint shadowColor = Rgb(20, 20, 20);
 
         // ---- Adaptive date/time rect layout (DPI-aware, no overlap) ----
         int gap = MulDiv(12, _dpi, 96);
@@ -792,22 +797,18 @@ internal static class Program
 
         // Post-process: convert magenta-background + text-foreground into per-pixel ARGB.
         //
-        // GDI anti-aliasing blends text color (T) with background color (B = magenta) at edge
-        // pixels: result = T*alpha + B*(1-alpha), where alpha is the text coverage (0..1).
-        // Solving for alpha:
-        //   For each channel c: result_c = T_c * alpha + B_c * (1 - alpha)
-        //                       alpha = (result_c - B_c) / (T_c - B_c)
-        // We compute alpha from the channel where |T_c - B_c| is largest (most sensitive),
-        // then un-blend to recover T_c, then write premultiplied ARGB.
+        // When shadow is DISABLED: every non-magenta pixel is a blend of magenta (B) and
+        // _textColor (T). We compute alpha = (channel - B) / (T - B) and un-blend to recover
+        // the true text color. This gives smooth anti-aliased edges.
         //
-        // Magenta background: B = (R=255, G=0, B=255).
-        // Text color: T = current _textColor components (may be the default or wallpaper-derived).
-        // We pick the channel with the largest |T_c - B_c| for alpha computation.
-        //   - Red:   |T_r - 255|
-        //   - Green: |T_g - 0|   = T_g
-        //   - Blue:  |T_b - 255|
-        // Green is usually the best choice when T has a high green component; we compute all
-        // three and pick the max dynamically so the algorithm works for any text color.
+        // When shadow is ENABLED: non-magenta pixels may be blends of magenta with EITHER
+        // _textColor OR shadowColor (or both, at shadow-text overlap edges). The single-
+        // foreground un-blend formula is wrong for shadow pixels — it produces color artifacts
+        // (e.g. gray shadow renders as translucent green). So when shadow is on, we skip the
+        // un-blend and just set alpha=255 for all non-magenta pixels (opaque, no anti-aliasing).
+        // This is a trade-off: shadow mode loses anti-aliasing but avoids color corruption.
+        bool hasShadow = shadowOffset > 0;
+
         byte tR = (byte)(_textColor & 0xFF);
         byte tG = (byte)((_textColor >> 8) & 0xFF);
         byte tB = (byte)((_textColor >> 16) & 0xFF);
@@ -815,8 +816,6 @@ internal static class Program
         int diffR = Math.Abs(tR - bR);
         int diffG = Math.Abs(tG - bG);  // = tG since bG=0
         int diffB = Math.Abs(tB - bB);
-        // Choose the channel with the largest |T-B| difference for alpha computation.
-        // If all diffs are 0 (text color == magenta, unlikely), fall back to green.
         int alphaChannel = diffG >= diffR && diffG >= diffB ? 1 : (diffR >= diffB ? 0 : 2);
         int tAlpha = alphaChannel == 0 ? tR : (alphaChannel == 1 ? tG : tB);
         int bAlpha = alphaChannel == 0 ? bR : (alphaChannel == 1 ? bG : bB);
@@ -826,12 +825,10 @@ internal static class Program
             byte b = _dibBitsBacking[i];        // DIB layout is BGRA
             byte g = _dibBitsBacking[i + 1];
             byte r = _dibBitsBacking[i + 2];
-            // byte a = _dibBitsBacking[i + 3];  // untouched by GDI; we'll set it ourselves
 
             // Detect pure background (magenta) — use a small tolerance for safety.
             if (r >= 250 && g <= 5 && b >= 250)
             {
-                // Background: fully transparent.
                 _dibBitsBacking[i] = 0;
                 _dibBitsBacking[i + 1] = 0;
                 _dibBitsBacking[i + 2] = 0;
@@ -839,38 +836,45 @@ internal static class Program
                 continue;
             }
 
-            // Compute alpha (0..255) from the chosen channel (largest |T-B| diff).
-            // alpha = (channel - bAlpha) * 255 / (tAlpha - bAlpha)
-            int channelVal = alphaChannel == 0 ? r : (alphaChannel == 1 ? g : b);
-            int denom = tAlpha - bAlpha;
-            int alpha = denom == 0 ? 0 : ((channelVal - bAlpha) * 255) / denom;
-            if (alpha > 255) alpha = 255;
-            if (alpha < 0) alpha = 0;
-
-            if (alpha == 0)
+            if (hasShadow)
             {
-                _dibBitsBacking[i] = 0;
-                _dibBitsBacking[i + 1] = 0;
-                _dibBitsBacking[i + 2] = 0;
-                _dibBitsBacking[i + 3] = 0;
+                // Shadow mode: can't un-blend because we don't know which foreground color
+                // (text or shadow) each pixel is. Just make it opaque with the raw RGB.
+                // Write premultiplied (RGB * 255 / 255 = RGB since alpha=255).
+                _dibBitsBacking[i] = b;
+                _dibBitsBacking[i + 1] = g;
+                _dibBitsBacking[i + 2] = r;
+                _dibBitsBacking[i + 3] = 255;
             }
             else
             {
-                // Un-blend: recover true text color for this pixel.
-                // result = T*alpha + B*(1-alpha) → T = (result - B*(1-alpha)) / alpha
-                // For premultiplied output we want T*alpha, so:
-                //   premultiplied = result - B*(1-alpha) = result - B + B*alpha
-                // We compute premultiplied B, G, R directly.
-                int pmB = b - (bB * (255 - alpha) + 128) / 255;
-                int pmG = g - (bG * (255 - alpha) + 128) / 255;
-                int pmR = r - (bR * (255 - alpha) + 128) / 255;
-                if (pmB < 0) pmB = 0; if (pmB > 255) pmB = 255;
-                if (pmG < 0) pmG = 0; if (pmG > 255) pmG = 255;
-                if (pmR < 0) pmR = 0; if (pmR > 255) pmR = 255;
-                _dibBitsBacking[i] = (byte)pmB;
-                _dibBitsBacking[i + 1] = (byte)pmG;
-                _dibBitsBacking[i + 2] = (byte)pmR;
-                _dibBitsBacking[i + 3] = (byte)alpha;
+                // No shadow: single-foreground un-blend for proper anti-aliasing.
+                int channelVal = alphaChannel == 0 ? r : (alphaChannel == 1 ? g : b);
+                int denom = tAlpha - bAlpha;
+                int alpha = denom == 0 ? 0 : ((channelVal - bAlpha) * 255) / denom;
+                if (alpha > 255) alpha = 255;
+                if (alpha < 0) alpha = 0;
+
+                if (alpha == 0)
+                {
+                    _dibBitsBacking[i] = 0;
+                    _dibBitsBacking[i + 1] = 0;
+                    _dibBitsBacking[i + 2] = 0;
+                    _dibBitsBacking[i + 3] = 0;
+                }
+                else
+                {
+                    int pmB = b - (bB * (255 - alpha) + 128) / 255;
+                    int pmG = g - (bG * (255 - alpha) + 128) / 255;
+                    int pmR = r - (bR * (255 - alpha) + 128) / 255;
+                    if (pmB < 0) pmB = 0; if (pmB > 255) pmB = 255;
+                    if (pmG < 0) pmG = 0; if (pmG > 255) pmG = 255;
+                    if (pmR < 0) pmR = 0; if (pmR > 255) pmR = 255;
+                    _dibBitsBacking[i] = (byte)pmB;
+                    _dibBitsBacking[i + 1] = (byte)pmG;
+                    _dibBitsBacking[i + 2] = (byte)pmR;
+                    _dibBitsBacking[i + 3] = (byte)alpha;
+                }
             }
         }
 
@@ -1071,7 +1075,7 @@ internal static class Program
             AppendMenu(menu, MfString | (_autoStart ? MfChecked : MfUnchecked), (IntPtr)CmdToggleAutoStart, "Start with Windows");
 
             // Accent Color (toggle) — use Windows system accent color as clock text color
-            AppendMenu(menu, MfString | (_useWallpaperColor ? MfChecked : MfUnchecked), (IntPtr)CmdToggleAccentColor, "Accent Color");
+            AppendMenu(menu, MfString | (_useAccentColor ? MfChecked : MfUnchecked), (IntPtr)CmdToggleAccentColor, "Accent Color");
 
             // Shadow submenu — text shadow intensity
             IntPtr shadowMenu = CreatePopupMenu();
@@ -1159,20 +1163,6 @@ internal static class Program
         => (int)(((long)nNumber * nNumerator) / nDenominator);
 
     private static uint Rgb(byte r, byte g, byte b) => (uint)(r | (g << 8) | (b << 16));
-
-    /// <summary>
-    /// Darkens an RGB color by the given factor (0.0 = black, 1.0 = unchanged).
-    /// </summary>
-    private static uint DarkenColor(uint color, double factor)
-    {
-        byte r = (byte)(color & 0xFF);
-        byte g = (byte)((color >> 8) & 0xFF);
-        byte b = (byte)((color >> 16) & 0xFF);
-        r = (byte)(r * factor);
-        g = (byte)(g * factor);
-        b = (byte)(b * factor);
-        return Rgb(r, g, b);
-    }
 
     // ---- Custom font input dialog + font availability check ----
 
@@ -1911,9 +1901,9 @@ internal static class Program
             {
                 _autoStart = true;
             }
-            if (root.TryGetProperty("useWallpaperColor", out var wpEl) && wpEl.ValueKind == System.Text.Json.JsonValueKind.True)
+            if (root.TryGetProperty("useAccentColor", out var wpEl) && wpEl.ValueKind == System.Text.Json.JsonValueKind.True)
             {
-                _useWallpaperColor = true;
+                _useAccentColor = true;
                 // Sample the wallpaper now so the first render uses the extracted color.
                 RefreshWallpaperColor();
             }
@@ -1955,12 +1945,21 @@ internal static class Program
                 ["language"] = _language,
                 ["timeFont"] = _timeFontName,
                 ["autoStart"] = _autoStart,
-                ["useWallpaperColor"] = _useWallpaperColor,
+                ["useAccentColor"] = _useAccentColor,
                 ["shadowLevel"] = _shadowLevel,
-                ["alwaysOnTop"] = _alwaysOnTop,
-                ["windowX"] = _savedWindowX,
-                ["windowY"] = _savedWindowY
+                ["alwaysOnTop"] = _alwaysOnTop
             };
+            // Only persist window position if it's been set (not the int.MinValue sentinel).
+            // This avoids writing bogus -2147483648 values on first run before the user moves
+            // the window.
+            if (_savedWindowX != int.MinValue)
+            {
+                obj["windowX"] = _savedWindowX;
+            }
+            if (_savedWindowY != int.MinValue)
+            {
+                obj["windowY"] = _savedWindowY;
+            }
             string json = System.Text.Json.JsonSerializer.Serialize(obj, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(path, json);
         }
