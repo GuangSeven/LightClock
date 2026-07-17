@@ -69,9 +69,10 @@ internal static class Program
     private const int CmdToggleAccentColor = 1030;
     private const int CmdToggleShadow = 1040;
     private const int CmdShadowOff = 1041;
-    private const int CmdShadowSmall = 1042;
-    private const int CmdShadowMedium = 1043;
-    private const int CmdShadowLarge = 1044;
+    private const int CmdShadowOpacity25 = 1042;
+    private const int CmdShadowOpacity50 = 1043;
+    private const int CmdShadowOpacity75 = 1044;
+    private const int CmdShadowOpacity100 = 1045;
 
     private const int WmCreate = 0x0001;
     private const int WmDestroy = 0x0002;
@@ -130,7 +131,7 @@ internal static class Program
 
     // Shadow intensity: 0 = off, 1 = small (2px), 2 = medium (4px), 3 = large (6px).
     // Shadow is rendered by drawing the text offset in a dark color before the main text.
-    private static int _shadowLevel = 0;
+    private static int _shadowOpacity = 0;
 
     // Path to the persistent settings file: %APPDATA%/LightClock/settings.json
     // Lazily computed because Environment.GetFolderPath isn't available on all targets.
@@ -492,20 +493,22 @@ internal static class Program
                     RenderAndPresent(hwnd);
                     SaveSettings();
                 }
-                else if (commandId == CmdShadowOff || commandId == CmdShadowSmall ||
-                         commandId == CmdShadowMedium || commandId == CmdShadowLarge)
+                else if (commandId == CmdShadowOff || commandId == CmdShadowOpacity25 ||
+                         commandId == CmdShadowOpacity50 || commandId == CmdShadowOpacity75 ||
+                         commandId == CmdShadowOpacity100)
                 {
-                    int newLevel = commandId switch
+                    int newOpacity = commandId switch
                     {
                         CmdShadowOff => 0,
-                        CmdShadowSmall => 1,
-                        CmdShadowMedium => 2,
-                        CmdShadowLarge => 3,
+                        CmdShadowOpacity25 => 25,
+                        CmdShadowOpacity50 => 50,
+                        CmdShadowOpacity75 => 75,
+                        CmdShadowOpacity100 => 100,
                         _ => 0
                     };
-                    if (_shadowLevel != newLevel)
+                    if (_shadowOpacity != newOpacity)
                     {
-                        _shadowLevel = newLevel;
+                        _shadowOpacity = newOpacity;
                         RenderAndPresent(hwnd);
                         SaveSettings();
                     }
@@ -702,18 +705,17 @@ internal static class Program
         //     text color. This gives smooth anti-aliased edges with proper per-pixel alpha.
         uint bgColor = Rgb(255, 0, 255);  // magenta sentinel
 
-        // Shadow offset in pixels, scaled by DPI. Level 0 = no shadow.
-        int shadowOffset = _shadowLevel switch
-        {
-            1 => Math.Max(1, MulDiv(2, _dpi, 96)),
-            2 => Math.Max(2, MulDiv(4, _dpi, 96)),
-            3 => Math.Max(3, MulDiv(6, _dpi, 96)),
-            _ => 0
-        };
-        // Shadow color: a fixed very-dark gray rather than a darkened version of the text
-        // color. Darkening the text color produces a mid-gray for bright text (e.g. white →
-        // 178,178,178) which reads as ghost text, not a shadow. A fixed dark color ensures
-        // the shadow is always darker than the surrounding pixels regardless of text color.
+        // Shadow: fixed offset (3px DPI-scaled), variable opacity (0-100%).
+        // When opacity > 0, we draw the text offset in a dark color before the main text.
+        // The post-process then assigns each pixel an alpha based on how "non-magenta" it is,
+        // and picks the nearest foreground color (text or shadow) for the RGB — this eliminates
+        // the magenta-edge artifact that the previous alpha=255 approach produced.
+        int shadowOffset = _shadowOpacity > 0 ? Math.Max(2, MulDiv(3, _dpi, 96)) : 0;
+        // Shadow opacity as 0-255 alpha. The shadow pixels' alpha in the final ARGB output
+        // is scaled by this factor so higher opacity = more visible shadow.
+        int shadowAlpha = (_shadowOpacity * 255) / 100;
+        // Shadow color: fixed very-dark gray. Always darker than surrounding pixels regardless
+        // of text color.
         uint shadowColor = Rgb(20, 20, 20);
 
         // ---- Adaptive date/time rect layout (DPI-aware, no overlap) ----
@@ -795,30 +797,37 @@ internal static class Program
         }
         Marshal.Copy(_dibBits, _dibBitsBacking, 0, byteCount);
 
-        // Post-process: convert magenta-background + text-foreground into per-pixel ARGB.
+        // Post-process: convert magenta-background + text/shadow-foreground into per-pixel ARGB.
         //
-        // When shadow is DISABLED: every non-magenta pixel is a blend of magenta (B) and
-        // _textColor (T). We compute alpha = (channel - B) / (T - B) and un-blend to recover
-        // the true text color. This gives smooth anti-aliased edges.
+        // For every non-magenta pixel, we need to determine:
+        //   1. Alpha: how much of the pixel is "foreground" vs "background (magenta)".
+        //      This is the coverage of the text/shadow glyph at this pixel.
+        //   2. RGB: which foreground color (text or shadow) is this pixel, and what's the
+        //      true color after removing the magenta blend.
         //
-        // When shadow is ENABLED: non-magenta pixels may be blends of magenta with EITHER
-        // _textColor OR shadowColor (or both, at shadow-text overlap edges). The single-
-        // foreground un-blend formula is wrong for shadow pixels — it produces color artifacts
-        // (e.g. gray shadow renders as translucent green). So when shadow is on, we skip the
-        // un-blend and just set alpha=255 for all non-magenta pixels (opaque, no anti-aliasing).
-        // This is a trade-off: shadow mode loses anti-aliasing but avoids color corruption.
-        bool hasShadow = shadowOffset > 0;
-
+        // Alpha computation: we measure how far the pixel's green channel is from magenta's
+        // green (0). Magenta has G=0; both text and shadow colors have G>0 (unless text is
+        // pure magenta, which is unlikely). So G directly tells us the foreground coverage:
+        //   G=0 → pure magenta (alpha=0), G=max(fgG) → pure foreground (alpha=255).
+        //
+        // For the text color, we know its green component (tG). For the shadow color (20,20,20),
+        // its green is 20. We pick the foreground whose green channel is closer to the pixel's
+        // green, then compute alpha relative to that foreground.
+        //
+        // This approach correctly handles:
+        //   - Pure text pixels (G close to tG) → high alpha, text color
+        //   - Pure shadow pixels (G close to 20) → high alpha scaled by shadowAlpha, shadow color
+        //   - AA edge pixels (G between 0 and fgG) → partial alpha, correct fg color
+        //   - Pure magenta (G=0) → alpha=0 (transparent)
+        //
+        // The previous approach (alpha=255 for all non-magenta in shadow mode) left AA edge
+        // pixels with their magenta-blended RGB, producing a visible magenta fringe.
         byte tR = (byte)(_textColor & 0xFF);
         byte tG = (byte)((_textColor >> 8) & 0xFF);
         byte tB = (byte)((_textColor >> 16) & 0xFF);
-        byte bR = 255, bG = 0, bB = 255;    // magenta background components
-        int diffR = Math.Abs(tR - bR);
-        int diffG = Math.Abs(tG - bG);  // = tG since bG=0
-        int diffB = Math.Abs(tB - bB);
-        int alphaChannel = diffG >= diffR && diffG >= diffB ? 1 : (diffR >= diffB ? 0 : 2);
-        int tAlpha = alphaChannel == 0 ? tR : (alphaChannel == 1 ? tG : tB);
-        int bAlpha = alphaChannel == 0 ? bR : (alphaChannel == 1 ? bG : bB);
+        byte sR = 20, sG = 20, sB = 20;  // shadowColor components
+        byte bR = 255, bG = 0, bB = 255;  // magenta background components
+        bool hasShadow = shadowOffset > 0;
 
         for (int i = 0; i < _dibBitsBacking.Length; i += 4)
         {
@@ -826,7 +835,7 @@ internal static class Program
             byte g = _dibBitsBacking[i + 1];
             byte r = _dibBitsBacking[i + 2];
 
-            // Detect pure background (magenta) — use a small tolerance for safety.
+            // Detect pure background (magenta) — use a small tolerance.
             if (r >= 250 && g <= 5 && b >= 250)
             {
                 _dibBitsBacking[i] = 0;
@@ -838,17 +847,61 @@ internal static class Program
 
             if (hasShadow)
             {
-                // Shadow mode: can't un-blend because we don't know which foreground color
-                // (text or shadow) each pixel is. Just make it opaque with the raw RGB.
-                // Write premultiplied (RGB * 255 / 255 = RGB since alpha=255).
-                _dibBitsBacking[i] = b;
-                _dibBitsBacking[i + 1] = g;
-                _dibBitsBacking[i + 2] = r;
-                _dibBitsBacking[i + 3] = 255;
+                // Determine whether this pixel is closer to text color or shadow color.
+                // Use Euclidean distance in RGB space.
+                int distText = (r - tR) * (r - tR) + (g - tG) * (g - tG) + (b - tB) * (b - tB);
+                int distShadow = (r - sR) * (r - sR) + (g - sG) * (g - sG) + (b - sB) * (b - sB);
+
+                byte fgR, fgG, fgB;
+                int maxAlpha;
+                if (distText <= distShadow)
+                {
+                    // This pixel is (primarily) text color.
+                    fgR = tR; fgG = tG; fgB = tB;
+                    maxAlpha = 255;  // text is always fully opaque
+                }
+                else
+                {
+                    // This pixel is (primarily) shadow color.
+                    fgR = sR; fgG = sG; fgB = sB;
+                    maxAlpha = shadowAlpha;  // shadow alpha scaled by opacity setting
+                }
+
+                // Compute coverage alpha from the green channel.
+                // G ranges from 0 (magenta) to fgG (pure foreground).
+                // alpha = g * maxAlpha / fgG (clamped 0..maxAlpha).
+                int alpha = fgG > 0 ? (g * maxAlpha) / fgG : 0;
+                if (alpha > maxAlpha) alpha = maxAlpha;
+                if (alpha < 0) alpha = 0;
+
+                // Un-blend: remove the magenta component to recover the true foreground color.
+                // result = fg * (alpha/maxAlpha) + magenta * (1 - alpha/maxAlpha)
+                // fg = (result - magenta * (1 - coverage)) / coverage
+                // where coverage = alpha / maxAlpha (0..1).
+                // For premultiplied output: pm = result - magenta * (1 - coverage)
+                int coverage = maxAlpha > 0 ? (alpha * 255) / maxAlpha : 0;
+                int pmB = b - (bB * (255 - coverage) + 128) / 255;
+                int pmG = g - (bG * (255 - coverage) + 128) / 255;
+                int pmR = r - (bR * (255 - coverage) + 128) / 255;
+                if (pmB < 0) pmB = 0; if (pmB > 255) pmB = 255;
+                if (pmG < 0) pmG = 0; if (pmG > 255) pmG = 255;
+                if (pmR < 0) pmR = 0; if (pmR > 255) pmR = 255;
+                _dibBitsBacking[i] = (byte)pmB;
+                _dibBitsBacking[i + 1] = (byte)pmG;
+                _dibBitsBacking[i + 2] = (byte)pmR;
+                _dibBitsBacking[i + 3] = (byte)alpha;
             }
             else
             {
                 // No shadow: single-foreground un-blend for proper anti-aliasing.
+                // Use the channel with the largest |T-B| difference for alpha computation.
+                int diffR = Math.Abs(tR - bR);
+                int diffG = Math.Abs(tG - bG);  // = tG since bG=0
+                int diffB = Math.Abs(tB - bB);
+                int alphaChannel = diffG >= diffR && diffG >= diffB ? 1 : (diffR >= diffB ? 0 : 2);
+                int tAlpha = alphaChannel == 0 ? tR : (alphaChannel == 1 ? tG : tB);
+                int bAlpha = alphaChannel == 0 ? bR : (alphaChannel == 1 ? bG : bB);
+
                 int channelVal = alphaChannel == 0 ? r : (alphaChannel == 1 ? g : b);
                 int denom = tAlpha - bAlpha;
                 int alpha = denom == 0 ? 0 : ((channelVal - bAlpha) * 255) / denom;
@@ -1077,12 +1130,13 @@ internal static class Program
             // Accent Color (toggle) — use Windows system accent color as clock text color
             AppendMenu(menu, MfString | (_useAccentColor ? MfChecked : MfUnchecked), (IntPtr)CmdToggleAccentColor, "Accent Color");
 
-            // Shadow submenu — text shadow intensity
+            // Shadow submenu — text shadow opacity
             IntPtr shadowMenu = CreatePopupMenu();
-            AppendMenu(shadowMenu, MfString | (_shadowLevel == 0 ? MfChecked : MfUnchecked), (IntPtr)CmdShadowOff, "Off");
-            AppendMenu(shadowMenu, MfString | (_shadowLevel == 1 ? MfChecked : MfUnchecked), (IntPtr)CmdShadowSmall, "Small");
-            AppendMenu(shadowMenu, MfString | (_shadowLevel == 2 ? MfChecked : MfUnchecked), (IntPtr)CmdShadowMedium, "Medium");
-            AppendMenu(shadowMenu, MfString | (_shadowLevel == 3 ? MfChecked : MfUnchecked), (IntPtr)CmdShadowLarge, "Large");
+            AppendMenu(shadowMenu, MfString | (_shadowOpacity == 0 ? MfChecked : MfUnchecked), (IntPtr)CmdShadowOff, "Off");
+            AppendMenu(shadowMenu, MfString | (_shadowOpacity == 25 ? MfChecked : MfUnchecked), (IntPtr)CmdShadowOpacity25, "25%");
+            AppendMenu(shadowMenu, MfString | (_shadowOpacity == 50 ? MfChecked : MfUnchecked), (IntPtr)CmdShadowOpacity50, "50%");
+            AppendMenu(shadowMenu, MfString | (_shadowOpacity == 75 ? MfChecked : MfUnchecked), (IntPtr)CmdShadowOpacity75, "75%");
+            AppendMenu(shadowMenu, MfString | (_shadowOpacity == 100 ? MfChecked : MfUnchecked), (IntPtr)CmdShadowOpacity100, "100%");
             AppendMenu(menu, MfString | 0x0010 /* MF_POPUP */, shadowMenu, "Shadow");
 
             // Exit
@@ -1907,10 +1961,12 @@ internal static class Program
                 // Sample the wallpaper now so the first render uses the extracted color.
                 RefreshWallpaperColor();
             }
-            if (root.TryGetProperty("shadowLevel", out var shadowEl) && shadowEl.ValueKind == System.Text.Json.JsonValueKind.Number)
+            if (root.TryGetProperty("shadowOpacity", out var shadowEl) && shadowEl.ValueKind == System.Text.Json.JsonValueKind.Number)
             {
-                int level = shadowEl.GetInt32();
-                if (level >= 0 && level <= 3) _shadowLevel = level;
+                int opacity = shadowEl.GetInt32();
+                // Accept both old 0-3 range and new 0-100 range for backward compat.
+                if (opacity >= 0 && opacity <= 3) opacity = opacity * 25;  // old: 0,1,2,3 → 0,25,50,75
+                if (opacity >= 0 && opacity <= 100) _shadowOpacity = opacity;
             }
             if (root.TryGetProperty("alwaysOnTop", out var topEl) && topEl.ValueKind == System.Text.Json.JsonValueKind.False)
             {
@@ -1946,7 +2002,7 @@ internal static class Program
                 ["timeFont"] = _timeFontName,
                 ["autoStart"] = _autoStart,
                 ["useAccentColor"] = _useAccentColor,
-                ["shadowLevel"] = _shadowLevel,
+                ["shadowOpacity"] = _shadowOpacity,
                 ["alwaysOnTop"] = _alwaysOnTop
             };
             // Only persist window position if it's been set (not the int.MinValue sentinel).
