@@ -129,9 +129,9 @@ internal static class Program
     // (the same color Windows derives from the wallpaper or that the user picks in Settings).
     private static bool _useAccentColor = false;
 
-    // Shadow intensity: 0 = off, 1 = small (2px), 2 = medium (4px), 3 = large (6px).
-    // Shadow is rendered by drawing the text offset in a dark color before the main text.
+    // Shadow opacity in percent (0-100). Offset is tracked separately.
     private static int _shadowOpacity = 0;
+    private static int _shadowOffsetPx = ShadowLogic.DefaultShadowOffsetPx;
 
     // Path to the persistent settings file: %APPDATA%/LightClock/settings.json
     // Lazily computed because Environment.GetFolderPath isn't available on all targets.
@@ -509,6 +509,10 @@ internal static class Program
                     if (_shadowOpacity != newOpacity)
                     {
                         _shadowOpacity = newOpacity;
+                        if (_shadowOpacity > 0 && _shadowOffsetPx <= 0)
+                        {
+                            _shadowOffsetPx = ShadowLogic.DefaultShadowOffsetPx;
+                        }
                         RenderAndPresent(hwnd);
                         SaveSettings();
                     }
@@ -705,12 +709,12 @@ internal static class Program
         //     text color. This gives smooth anti-aliased edges with proper per-pixel alpha.
         uint bgColor = Rgb(255, 0, 255);  // magenta sentinel
 
-        // Shadow: fixed offset (3px DPI-scaled), variable opacity (0-100%).
+        // Shadow: configurable base offset (default 3px at 96 DPI), variable opacity (0-100%).
         // When opacity > 0, we draw the text offset in a dark color before the main text.
         // The post-process then assigns each pixel an alpha based on how "non-magenta" it is,
         // and picks the nearest foreground color (text or shadow) for the RGB — this eliminates
         // the magenta-edge artifact that the previous alpha=255 approach produced.
-        int shadowOffset = _shadowOpacity > 0 ? Math.Max(2, MulDiv(3, _dpi, 96)) : 0;
+        int shadowOffset = ShadowLogic.GetScaledShadowOffset(_shadowOpacity, _shadowOffsetPx, _dpi);
         // Shadow opacity as 0-255 alpha. The shadow pixels' alpha in the final ARGB output
         // is scaled by this factor so higher opacity = more visible shadow.
         int shadowAlpha = (_shadowOpacity * 255) / 100;
@@ -870,9 +874,15 @@ internal static class Program
                 // Compute coverage alpha from the green channel.
                 // G ranges from 0 (magenta) to fgG (pure foreground).
                 // alpha = g * maxAlpha / fgG (clamped 0..maxAlpha).
-                int alpha = fgG > 0 ? (g * maxAlpha) / fgG : 0;
-                if (alpha > maxAlpha) alpha = maxAlpha;
-                if (alpha < 0) alpha = 0;
+                int alpha = ShadowLogic.ComputeAlphaFromBlend(r, g, b, fgR, fgG, fgB, bR, bG, bB, maxAlpha);
+                if (alpha == 0)
+                {
+                    _dibBitsBacking[i] = 0;
+                    _dibBitsBacking[i + 1] = 0;
+                    _dibBitsBacking[i + 2] = 0;
+                    _dibBitsBacking[i + 3] = 0;
+                    continue;
+                }
 
                 // Un-blend: remove the magenta component to recover the true foreground color.
                 // result = fg * (alpha/maxAlpha) + magenta * (1 - alpha/maxAlpha)
@@ -895,18 +905,7 @@ internal static class Program
             {
                 // No shadow: single-foreground un-blend for proper anti-aliasing.
                 // Use the channel with the largest |T-B| difference for alpha computation.
-                int diffR = Math.Abs(tR - bR);
-                int diffG = Math.Abs(tG - bG);  // = tG since bG=0
-                int diffB = Math.Abs(tB - bB);
-                int alphaChannel = diffG >= diffR && diffG >= diffB ? 1 : (diffR >= diffB ? 0 : 2);
-                int tAlpha = alphaChannel == 0 ? tR : (alphaChannel == 1 ? tG : tB);
-                int bAlpha = alphaChannel == 0 ? bR : (alphaChannel == 1 ? bG : bB);
-
-                int channelVal = alphaChannel == 0 ? r : (alphaChannel == 1 ? g : b);
-                int denom = tAlpha - bAlpha;
-                int alpha = denom == 0 ? 0 : ((channelVal - bAlpha) * 255) / denom;
-                if (alpha > 255) alpha = 255;
-                if (alpha < 0) alpha = 0;
+                int alpha = ShadowLogic.ComputeAlphaFromBlend(r, g, b, tR, tG, tB, bR, bG, bB, 255);
 
                 if (alpha == 0)
                 {
@@ -1961,13 +1960,24 @@ internal static class Program
                 // Sample the wallpaper now so the first render uses the extracted color.
                 RefreshWallpaperColor();
             }
+            int? shadowOpacity = null;
+            int? shadowOffsetPx = null;
+            int? shadowLevel = null;
             if (root.TryGetProperty("shadowOpacity", out var shadowEl) && shadowEl.ValueKind == System.Text.Json.JsonValueKind.Number)
             {
-                int opacity = shadowEl.GetInt32();
-                // Accept both old 0-3 range and new 0-100 range for backward compat.
-                if (opacity >= 0 && opacity <= 3) opacity = opacity * 25;  // old: 0,1,2,3 → 0,25,50,75
-                if (opacity >= 0 && opacity <= 100) _shadowOpacity = opacity;
+                shadowOpacity = shadowEl.GetInt32();
             }
+            if (root.TryGetProperty("shadowOffsetPx", out var shadowOffsetEl) && shadowOffsetEl.ValueKind == System.Text.Json.JsonValueKind.Number)
+            {
+                shadowOffsetPx = shadowOffsetEl.GetInt32();
+            }
+            if (root.TryGetProperty("shadowLevel", out var shadowLevelEl) && shadowLevelEl.ValueKind == System.Text.Json.JsonValueKind.Number)
+            {
+                shadowLevel = shadowLevelEl.GetInt32();
+            }
+            var resolvedShadow = ShadowLogic.ResolveFromSettings(shadowOpacity, shadowOffsetPx, shadowLevel);
+            _shadowOpacity = resolvedShadow.Opacity;
+            _shadowOffsetPx = resolvedShadow.BaseOffsetPx;
             if (root.TryGetProperty("alwaysOnTop", out var topEl) && topEl.ValueKind == System.Text.Json.JsonValueKind.False)
             {
                 _alwaysOnTop = false;
@@ -2003,6 +2013,7 @@ internal static class Program
                 ["autoStart"] = _autoStart,
                 ["useAccentColor"] = _useAccentColor,
                 ["shadowOpacity"] = _shadowOpacity,
+                ["shadowOffsetPx"] = _shadowOffsetPx,
                 ["alwaysOnTop"] = _alwaysOnTop
             };
             // Only persist window position if it's been set (not the int.MinValue sentinel).
