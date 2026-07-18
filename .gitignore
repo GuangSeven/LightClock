@@ -13,16 +13,59 @@ build/
 dist/
 target/
 
-# Dependencies
-node_modules/
-venv/
-.venv/
-__pycache__/
-.mypy_cache/
-.pytest_cache/
-.gradle/
-julia-*/
-zig*/
+# .NET build outputs
+bin/
+obj/
+*.pdb
+
+# .NET SDK / NuGet
+packages/
+.nuget/
+*.nupkg
+*.snupkg
+
+# Publish outputs
+publish/
+
+# Visual Studio / Rider / VS Code
+.vs/
+*.user
+*.suo
+*.userprefs
+*.sln.docstates
+*.csproj.user
+*.vbproj.user
+*.vcxproj.user
+*.vcxproj.filters.user
+*.csproj.user
+*.vbproj.user
+*.vcxproj.user
+*.vcxproj.filters.user
+*.ncb
+*.opensdf
+*.sdf
+*.swp
+*.swo
+
+# ReSharper / Rider
+_ReSharper*/
+*.resharper
+*.dotSettings
+*.dotSettings.user
+
+# Test results
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+*.vspscc
+*.vssscc
+
+# dotnet CLI
+*.runtimeconfig.json
+*.runtimeconfig.dev.json
+*.deps.json
+*.deps.json
 
 # Editors
 .vscode/

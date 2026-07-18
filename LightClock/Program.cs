@@ -169,6 +169,15 @@ internal static class Program
     private static IntPtr _dibBits = IntPtr.Zero;
     private static byte[]? _dibBitsBacking;
 
+    // Per-pixel foreground coverage buffers (one byte per pixel, 0..255) used by the
+    // two-pass renderer: we render text alone into the DIB and snapshot its glyph coverage
+    // into _textCoverage, then render shadow alone and snapshot into _shadowCoverage.
+    // Compositing these two layers independently is what decouples shadow opacity from the
+    // text appearance — the text alpha is always 255 inside the glyph (no scaling by
+    // shadowAlpha), so adjusting the Shadow menu only affects areas where text coverage is 0.
+    private static byte[]? _textCoverage;
+    private static byte[]? _shadowCoverage;
+
     private const int DpiDateFontHeight = 56;
     private const int DpiTimeFontHeight = 168;
 
@@ -321,7 +330,7 @@ internal static class Program
         // is behind the window.
         //
         // We do NOT call SetLayeredWindowAttributes here — that would override UpdateLayeredWindow.
-        SetWindowPos(hwnd, HwndTopmost, 0, 0, 0, 0, SwpNomove | SwpNosize | SwpShowWindow);
+        SetWindowPos(hwnd, _alwaysOnTop ? HwndTopmost : HwndNotTopmost, 0, 0, 0, 0, SwpNomove | SwpNosize | SwpShowWindow);
 
         UpdateClockText();
         RenderAndPresent(hwnd);
@@ -345,6 +354,15 @@ internal static class Program
             case WmTimer:
                 if (wParam == (IntPtr)TimerId)
                 {
+                    // If the window was hidden (e.g., by Win+D / Show Desktop), re-show it.
+                    // This avoids interfering with the Shell's window enumeration during
+                    // MinimizeAll (which previously stripped SWP_HIDEWINDOW and caused
+                    // explorer instability/restarts).
+                    if (!IsWindowVisible(hwnd))
+                    {
+                        SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0,
+                            SwpNomove | SwpNosize | SwpNozorder | SwpNoactivate | SwpShowWindow);
+                    }
                     UpdateClockText();
                     // Periodically re-sample the wallpaper color (every WallpaperResampleIntervalTicks
                     // seconds) so the clock adapts when the user changes their wallpaper.
@@ -574,26 +592,15 @@ internal static class Program
 
             case WmWindowPosChanging:
                 // Win+D (Show Desktop) hides all top-level windows by sending WM_WINDOWPOSCHANGING
-                // with the SWP_HIDEWINDOW flag. We strip that flag here so the clock stays visible
-                // when the user presses Win+D. This also blocks programmatic minimize-all commands
-                // from hiding the clock while still allowing normal minimize via the taskbar (which
-                // this window doesn't have, being a WS_EX_TOOLWINDOW).
+                // with the SWP_HIDEWINDOW flag. We previously stripped this flag to keep the
+                // clock visible, but that interferes with the shell's window management and can
+                // cause explorer to restart. The correct approach is to allow the hide and
+                // re-show the window on the next timer tick (WM_TIMER) if it's meant to be visible.
                 //
-                // IMPORTANT: after editing the WINDOWPOS struct, we must fall through to
-                // DefWindowProc so other position changes (move, resize, Z-order) are applied
-                // normally. Previously we returned IntPtr.Zero here, which swallowed ALL
-                // position changes including Z-order → the 'Always on Top' toggle (which uses
-                // HWND_TOPMOST/HWND_NOTOPMOST via SetWindowPos) had no effect, so the clock
-                // was permanently stuck on top.
-                if (wParam != IntPtr.Zero)
-                {
-                    var wp = Marshal.PtrToStructure<WindowPos>(wParam);
-                    if ((wp.flags & SwpHideWindow) != 0)
-                    {
-                        wp.flags &= ~(uint)SwpHideWindow;
-                        Marshal.StructureToPtr(wp, wParam, fDeleteOld: false);
-                    }
-                }
+                // IMPORTANT: we fall through to DefWindowProc so other position changes (move,
+                // resize, Z-order) are applied normally. Previously we returned IntPtr.Zero here,
+                // which swallowed ALL position changes including Z-order → the 'Always on Top'
+                // toggle (which uses HWND_TOPMOST/HWND_NOTOPMOST via SetWindowPos) had no effect.
                 break;  // fall through to DefWindowProc
 
             case WmMove:
@@ -674,12 +681,6 @@ internal static class Program
             return;
         }
 
-        // Clear the REAL DIB pixel memory to fully transparent (all zero).
-        // This must touch the DIB's own memory (via _dibBits pointer), NOT a byte[] copy.
-        // If we only cleared a copy, the next DrawText would stack on top of the previous
-        // frame's glyphs → digits would never disappear, causing the overlap bug.
-        RtlZeroMemory(_dibBits, (nuint)(width * height * 4));
-
         // Lazily create fonts once and reuse them across paints to avoid leaking GDI handles.
         // Scale by current DPI so the clock stays readable when dragged between monitors with different DPI.
         int dateHeight = MulDiv(DpiDateFontHeight, _dpi, 96);
@@ -696,31 +697,29 @@ internal static class Program
             ? CreateFont(timeHeight, 0, 0, 0, 600, 0, 0, 0, DefaultCharset, OutTtPrecis, ClipDefaultPrecis, CleartypeQuality, _timeFontPitchAndFamily, _timeFontName)
             : _timeFontHandle;
 
-        // Set up the memory DC for text rendering.
-        // We render with OPAQUE background mode and a sentinel 'background' color (magenta,
-        // RGB(255,0,255)) so we can distinguish background pixels from text pixels in
-        // post-processing. GDI's DrawText does NOT write the alpha channel of a 32-bit DIB,
-        // so we can't rely on alpha to tell us where text was drawn.
-        //
-        // After DrawText, we walk the pixels:
-        //   - Pixels exactly equal to magenta -> background -> set alpha = 0 (fully transparent).
-        //   - Pixels that aren't magenta -> text (or anti-aliased blend of text and magenta)
-        //     -> set alpha = 255 and un-blend the magenta out of the RGB to recover the true
-        //     text color. This gives smooth anti-aliased edges with proper per-pixel alpha.
+        // Background sentinel color (magenta). GDI's DrawText does NOT write the alpha channel
+        // of a 32-bit DIB, so we use a sentinel background color to detect glyph coverage in
+        // post-processing: a pixel that equals magenta is pure background (alpha = 0); a pixel
+        // that is a blend of magenta and the foreground color indicates the foreground glyph
+        // coverage at that pixel.
         uint bgColor = Rgb(255, 0, 255);  // magenta sentinel
+        byte bR = 255, bG = 0, bB = 255;  // magenta RGB components
 
-        // Shadow: configurable base offset (default 3px at 96 DPI), variable opacity (0-100%).
-        // When opacity > 0, we draw the text offset in a dark color before the main text.
-        // The post-process then assigns each pixel an alpha based on how "non-magenta" it is,
-        // and picks the nearest foreground color (text or shadow) for the RGB — this eliminates
-        // the magenta-edge artifact that the previous alpha=255 approach produced.
+        // Shadow parameters: configurable base offset (default 3px at 96 DPI), variable
+        // opacity (0-100%). The shadow is rendered into a SEPARATE pass from the text, and
+        // its per-pixel alpha is scaled by shadowAlpha — the text alpha is ALWAYS 255 inside
+        // the glyph (i.e. text is fully opaque regardless of the shadow opacity setting).
+        // This decouples the two so that adjusting shadow no longer affects the text. The
+        // previous single-DIB approach used a color-distance classifier that could
+        // misclassify pixels and leak the shadow opacity scaling into text edges.
         int shadowOffset = ShadowLogic.GetScaledShadowOffset(_shadowOpacity, _shadowOffsetPx, _dpi);
-        // Shadow opacity as 0-255 alpha. The shadow pixels' alpha in the final ARGB output
-        // is scaled by this factor so higher opacity = more visible shadow.
-        int shadowAlpha = (_shadowOpacity * 255) / 100;
-        // Shadow color: fixed very-dark gray. Always darker than surrounding pixels regardless
-        // of text color.
+        int shadowAlpha = (_shadowOpacity * 255) / 100;  // 0..255 — scales ONLY the shadow
         uint shadowColor = Rgb(20, 20, 20);
+        byte sR = 20, sG = 20, sB = 20;
+
+        byte tR = (byte)(_textColor & 0xFF);
+        byte tG = (byte)((_textColor >> 8) & 0xFF);
+        byte tB = (byte)((_textColor >> 16) & 0xFF);
 
         // ---- Adaptive date/time rect layout (DPI-aware, no overlap) ----
         int gap = MulDiv(12, _dpi, 96);
@@ -730,13 +729,6 @@ internal static class Program
         int timeTop = dateBottom + gap;
         int timeBottom = rect.bottom - MulDiv(10, _dpi, 96);
 
-        // ---- Pass 1: Fill background with magenta (OPAQUE mode) ----
-        SetBkMode(_memDc, OpaqueBkMode);
-        SetBkColor(_memDc, bgColor);
-        using var bgBrush = new GdiObject(CreateSolidBrush(bgColor));
-        FillRect(_memDc, ref rect, bgBrush.Handle);
-
-        // Declare rects up here so both shadow and main-text passes can use them.
         var dateRect = new Rect
         {
             left = rect.left,
@@ -752,13 +744,77 @@ internal static class Program
             bottom = timeBottom
         };
 
-        // ---- Pass 2: Draw shadow (if enabled) ----
-        if (shadowOffset > 0)
+        int pixelCount = width * height;
+        int byteCount = pixelCount * 4;
+        if (_dibBitsBacking == null || _dibBitsBacking.Length != byteCount)
         {
+            _dibBitsBacking = new byte[byteCount];
+        }
+        // Per-pixel foreground coverage buffers: 0..255 each. Lazily allocated and reused
+        // across frames. We need two buffers — one for the text glyph coverage and one for
+        // the shadow glyph coverage — so we can composite them with independent alphas
+        // (text always 255 max, shadow scaled by shadowAlpha).
+        if (_textCoverage == null || _textCoverage.Length != pixelCount)
+        {
+            _textCoverage = new byte[pixelCount];
+        }
+        bool hasShadow = shadowOffset > 0;
+        if (_shadowCoverage == null || _shadowCoverage.Length != pixelCount)
+        {
+            _shadowCoverage = new byte[pixelCount];
+        }
+        // We always recompute both coverage buffers fully per frame; only clear the parts
+        // we touch. FillRect + DrawText rewrite every pixel in the DIB each pass, so the
+        // captured coverage arrays will be fully populated. No need to zero them.
+
+        using var bgBrush = new GdiObject(CreateSolidBrush(bgColor));
+
+        // ---- Pass R: Render TEXT ONLY into the DIB, capture text coverage ----
+        // Fill the entire DIB with magenta so any non-glyph pixel is detected as background.
+        SetBkMode(_memDc, OpaqueBkMode);
+        SetBkColor(_memDc, bgColor);
+        FillRect(_memDc, ref rect, bgBrush.Handle);
+        // Draw text with TRANSPARENT bk mode so glyph edges blend with the magenta BkColor
+        // (still in effect), not with any underlying pixel.
+        SetBkMode(_memDc, TransparentBkMode);
+        SetTextColor(_memDc, _textColor);
+        IntPtr oldFontR = SelectObject(_memDc, _dateFontHandle);
+        DrawText(_memDc, _dateText, _dateText.Length, ref dateRect, DtCenter | DtVCenter | DtSingleLine);
+        SelectObject(_memDc, _timeFontHandle);
+        DrawText(_memDc, _timeText, _timeText.Length, ref timeRect, DtCenter | DtVCenter | DtSingleLine);
+        SelectObject(_memDc, oldFontR);
+        // Snapshot the DIB and compute per-pixel text coverage (0..255).
+        Marshal.Copy(_dibBits, _dibBitsBacking, 0, byteCount);
+        for (int i = 0, p = 0; i < byteCount; i += 4, p++)
+        {
+            byte b = _dibBitsBacking[i];
+            byte g = _dibBitsBacking[i + 1];
+            byte r = _dibBitsBacking[i + 2];
+            // Magenta background => no text coverage.
+            if (r >= 250 && g <= 5 && b >= 250)
+            {
+                _textCoverage[p] = 0;
+                continue;
+            }
+            // Coverage measured by whichever channel has the largest |text - magenta| distance.
+            // maxAlpha=255 so the returned alpha is the actual 0..255 coverage at this pixel
+            // (NOT scaled by shadow — text is always fully opaque wherever the glyph covers).
+            int cov = ShadowLogic.ComputeAlphaFromBlend(r, g, b, tR, tG, tB, bR, bG, bB, 255);
+            if (cov < 0) cov = 0; if (cov > 255) cov = 255;
+            _textCoverage[p] = (byte)cov;
+        }
+
+        // ---- Pass S: Render SHADOW ONLY into the DIB, capture shadow coverage ----
+        if (hasShadow)
+        {
+            // Re-fill with magenta so the DIB only contains shadow glyphs against magenta.
+            SetBkMode(_memDc, OpaqueBkMode);
+            SetBkColor(_memDc, bgColor);
+            FillRect(_memDc, ref rect, bgBrush.Handle);
+
             SetBkMode(_memDc, TransparentBkMode);
             SetTextColor(_memDc, shadowColor);
-
-            IntPtr oldFont2 = SelectObject(_memDc, _dateFontHandle);
+            IntPtr oldFontS = SelectObject(_memDc, _dateFontHandle);
             var shadowDateRect = new Rect
             {
                 left = dateRect.left + shadowOffset,
@@ -767,7 +823,6 @@ internal static class Program
                 bottom = dateBottom + shadowOffset
             };
             DrawText(_memDc, _dateText, _dateText.Length, ref shadowDateRect, DtCenter | DtVCenter | DtSingleLine);
-
             SelectObject(_memDc, _timeFontHandle);
             var shadowTimeRect = new Rect
             {
@@ -777,70 +832,57 @@ internal static class Program
                 bottom = timeBottom + shadowOffset
             };
             DrawText(_memDc, _timeText, _timeText.Length, ref shadowTimeRect, DtCenter | DtVCenter | DtSingleLine);
-            SelectObject(_memDc, oldFont2);
+            SelectObject(_memDc, oldFontS);
+
+            Marshal.Copy(_dibBits, _dibBitsBacking, 0, byteCount);
+            for (int i = 0, p = 0; i < byteCount; i += 4, p++)
+            {
+                byte b = _dibBitsBacking[i];
+                byte g = _dibBitsBacking[i + 1];
+                byte r = _dibBitsBacking[i + 2];
+                if (r >= 250 && g <= 5 && b >= 250)
+                {
+                    _shadowCoverage[p] = 0;
+                    continue;
+                }
+                // Get pure 0..255 shadow glyph coverage at this pixel — NOT yet scaled by
+                // shadowAlpha. We scale at composite time so the shadow alpha is independent
+                // of the text path.
+                int cov = ShadowLogic.ComputeAlphaFromBlend(r, g, b, sR, sG, sB, bR, bG, bB, 255);
+                if (cov < 0) cov = 0; if (cov > 255) cov = 255;
+                _shadowCoverage[p] = (byte)cov;
+            }
+        }
+        else
+        {
+            // No shadow pass — clear the shadow coverage buffer.
+            System.Array.Clear(_shadowCoverage, 0, pixelCount);
         }
 
-        // ---- Pass 3: Draw main text on top (TRANSPARENT mode so it doesn't overwrite shadow) ----
-        SetBkMode(_memDc, TransparentBkMode);
-        SetTextColor(_memDc, _textColor);
-
-        IntPtr oldFont = SelectObject(_memDc, _dateFontHandle);
-        DrawText(_memDc, _dateText, _dateText.Length, ref dateRect, DtCenter | DtVCenter | DtSingleLine);
-
-        SelectObject(_memDc, _timeFontHandle);
-        DrawText(_memDc, _timeText, _timeText.Length, ref timeRect, DtCenter | DtVCenter | DtSingleLine);
-        SelectObject(_memDc, oldFont);
-
-        // Copy the CURRENT DIB pixel data (post-DrawText) into our managed buffer so we can
-        // post-process it. This is a READ from DIB memory, NOT a write to it. After processing,
-        // we Marshal.Copy back into the DIB so UpdateLayeredWindow sees the correct pixels.
-        int byteCount = width * height * 4;
-        if (_dibBitsBacking == null || _dibBitsBacking.Length != byteCount)
+        // ---- Composite: produce the final premultiplied ARGB output ----
+        // For each pixel we composite shadow THEN text (text wins where it has coverage):
+        //
+        //   shadow_alpha_out = shadow_cov * shadowAlpha / 255     (0 when shadow disabled)
+        //   text_alpha_in     = text_cov                            (text always 0..255)
+        //   final_alpha       = text_a + shadow_a*(255-text_a)/255   (standard over op)
+        //   final_rgb_premult = text_rgb * text_a / 255
+        //                   + shadow_rgb * shadow_a * (255-text_a) / 65025
+        //
+        // Specialization that the math reduces to:
+        //   - if text_cov == 0: just shadow (premultiplied by shadow_alpha_out)
+        //   - if text_cov == 255: just text opaque (RGB = text, alpha = 255, shadow hidden)
+        //   - else (AA edge or partial overlap): blended properly
+        //
+        // Critically, text_cov is INDEPENDENT of shadowAlpha — so adjusting the shadow
+        // only affects the parts of the picture where text_cov == 0 (pure-shadow regions).
+        // The text ALWAYS looks the same — fully opaque inside the glyph, smooth at the
+        // AA edges against whatever is behind the window.
+        for (int i = 0, p = 0; i < byteCount; i += 4, p++)
         {
-            _dibBitsBacking = new byte[byteCount];
-        }
-        Marshal.Copy(_dibBits, _dibBitsBacking, 0, byteCount);
+            int tc = _textCoverage[p];
+            int sc = hasShadow ? _shadowCoverage[p] : 0;
 
-        // Post-process: convert magenta-background + text/shadow-foreground into per-pixel ARGB.
-        //
-        // For every non-magenta pixel, we need to determine:
-        //   1. Alpha: how much of the pixel is "foreground" vs "background (magenta)".
-        //      This is the coverage of the text/shadow glyph at this pixel.
-        //   2. RGB: which foreground color (text or shadow) is this pixel, and what's the
-        //      true color after removing the magenta blend.
-        //
-        // Alpha computation: we measure how far the pixel's green channel is from magenta's
-        // green (0). Magenta has G=0; both text and shadow colors have G>0 (unless text is
-        // pure magenta, which is unlikely). So G directly tells us the foreground coverage:
-        //   G=0 → pure magenta (alpha=0), G=max(fgG) → pure foreground (alpha=255).
-        //
-        // For the text color, we know its green component (tG). For the shadow color (20,20,20),
-        // its green is 20. We pick the foreground whose green channel is closer to the pixel's
-        // green, then compute alpha relative to that foreground.
-        //
-        // This approach correctly handles:
-        //   - Pure text pixels (G close to tG) → high alpha, text color
-        //   - Pure shadow pixels (G close to 20) → high alpha scaled by shadowAlpha, shadow color
-        //   - AA edge pixels (G between 0 and fgG) → partial alpha, correct fg color
-        //   - Pure magenta (G=0) → alpha=0 (transparent)
-        //
-        // The previous approach (alpha=255 for all non-magenta in shadow mode) left AA edge
-        // pixels with their magenta-blended RGB, producing a visible magenta fringe.
-        byte tR = (byte)(_textColor & 0xFF);
-        byte tG = (byte)((_textColor >> 8) & 0xFF);
-        byte tB = (byte)((_textColor >> 16) & 0xFF);
-        byte sR = 20, sG = 20, sB = 20;  // shadowColor components
-        byte bR = 255, bG = 0, bB = 255;  // magenta background components
-        bool hasShadow = shadowOffset > 0;
-
-        for (int i = 0; i < _dibBitsBacking.Length; i += 4)
-        {
-            byte b = _dibBitsBacking[i];        // DIB layout is BGRA
-            byte g = _dibBitsBacking[i + 1];
-            byte r = _dibBitsBacking[i + 2];
-
-            // Detect pure background (magenta) — use a small tolerance.
-            if (r >= 250 && g <= 5 && b >= 250)
+            if (tc == 0 && sc == 0)
             {
                 _dibBitsBacking[i] = 0;
                 _dibBitsBacking[i + 1] = 0;
@@ -849,85 +891,32 @@ internal static class Program
                 continue;
             }
 
-            if (hasShadow)
-            {
-                // Determine whether this pixel is closer to text color or shadow color.
-                // Use Euclidean distance in RGB space.
-                int distText = (r - tR) * (r - tR) + (g - tG) * (g - tG) + (b - tB) * (b - tB);
-                int distShadow = (r - sR) * (r - sR) + (g - sG) * (g - sG) + (b - sB) * (b - sB);
+            // Shadow's effective alpha contribution at this pixel.
+            int sa = (sc * shadowAlpha + 128) / 255;  // 0..shadowAlpha
+            // Text's effective alpha contribution.
+            int ta = tc;
 
-                byte fgR, fgG, fgB;
-                int maxAlpha;
-                if (distText <= distShadow)
-                {
-                    // This pixel is (primarily) text color.
-                    fgR = tR; fgG = tG; fgB = tB;
-                    maxAlpha = 255;  // text is always fully opaque
-                }
-                else
-                {
-                    // This pixel is (primarily) shadow color.
-                    fgR = sR; fgG = sG; fgB = sB;
-                    maxAlpha = shadowAlpha;  // shadow alpha scaled by opacity setting
-                }
+            // Standard over-compositing: result = text over shadow.
+            // final_alpha = ta + sa*(255-ta)/255
+            int finalA = ta + (sa * (255 - ta) + 128) / 255;
+            if (finalA > 255) finalA = 255;
 
-                // Compute coverage alpha from the green channel.
-                // G ranges from 0 (magenta) to fgG (pure foreground).
-                // alpha = g * maxAlpha / fgG (clamped 0..maxAlpha).
-                int alpha = ShadowLogic.ComputeAlphaFromBlend(r, g, b, fgR, fgG, fgB, bR, bG, bB, maxAlpha);
-                if (alpha == 0)
-                {
-                    _dibBitsBacking[i] = 0;
-                    _dibBitsBacking[i + 1] = 0;
-                    _dibBitsBacking[i + 2] = 0;
-                    _dibBitsBacking[i + 3] = 0;
-                    continue;
-                }
+            // Premultiplied RGB: text contribution + shadow contribution pre-multiplied by
+            // their effective alphas. Each term divided by 255 appropriately.
+            //   pm = text_rgb * ta / 255      + shadow_rgb * sa * (255-ta) / 255 / 255
+            // Use rounding (+128) on each integer division to reduce banding.
+            int denom = 255 * 255;
+            int pmB = (tB * ta * 255 + sB * sa * (255 - ta) + denom / 2) / denom;
+            int pmG = (tG * ta * 255 + sG * sa * (255 - ta) + denom / 2) / denom;
+            int pmR = (tR * ta * 255 + sR * sa * (255 - ta) + denom / 2) / denom;
+            if (pmB < 0) pmB = 0; if (pmB > finalA) pmB = finalA;  // premultiplied clamp
+            if (pmG < 0) pmG = 0; if (pmG > finalA) pmG = finalA;
+            if (pmR < 0) pmR = 0; if (pmR > finalA) pmR = finalA;
 
-                // Un-blend: remove the magenta component to recover the true foreground color.
-                // result = fg * (alpha/maxAlpha) + magenta * (1 - alpha/maxAlpha)
-                // fg = (result - magenta * (1 - coverage)) / coverage
-                // where coverage = alpha / maxAlpha (0..1).
-                // For premultiplied output: pm = result - magenta * (1 - coverage)
-                int coverage = maxAlpha > 0 ? (alpha * 255) / maxAlpha : 0;
-                int pmB = b - (bB * (255 - coverage) + 128) / 255;
-                int pmG = g - (bG * (255 - coverage) + 128) / 255;
-                int pmR = r - (bR * (255 - coverage) + 128) / 255;
-                if (pmB < 0) pmB = 0; if (pmB > 255) pmB = 255;
-                if (pmG < 0) pmG = 0; if (pmG > 255) pmG = 255;
-                if (pmR < 0) pmR = 0; if (pmR > 255) pmR = 255;
-                _dibBitsBacking[i] = (byte)pmB;
-                _dibBitsBacking[i + 1] = (byte)pmG;
-                _dibBitsBacking[i + 2] = (byte)pmR;
-                _dibBitsBacking[i + 3] = (byte)alpha;
-            }
-            else
-            {
-                // No shadow: single-foreground un-blend for proper anti-aliasing.
-                // Use the channel with the largest |T-B| difference for alpha computation.
-                int alpha = ShadowLogic.ComputeAlphaFromBlend(r, g, b, tR, tG, tB, bR, bG, bB, 255);
-
-                if (alpha == 0)
-                {
-                    _dibBitsBacking[i] = 0;
-                    _dibBitsBacking[i + 1] = 0;
-                    _dibBitsBacking[i + 2] = 0;
-                    _dibBitsBacking[i + 3] = 0;
-                }
-                else
-                {
-                    int pmB = b - (bB * (255 - alpha) + 128) / 255;
-                    int pmG = g - (bG * (255 - alpha) + 128) / 255;
-                    int pmR = r - (bR * (255 - alpha) + 128) / 255;
-                    if (pmB < 0) pmB = 0; if (pmB > 255) pmB = 255;
-                    if (pmG < 0) pmG = 0; if (pmG > 255) pmG = 255;
-                    if (pmR < 0) pmR = 0; if (pmR > 255) pmR = 255;
-                    _dibBitsBacking[i] = (byte)pmB;
-                    _dibBitsBacking[i + 1] = (byte)pmG;
-                    _dibBitsBacking[i + 2] = (byte)pmR;
-                    _dibBitsBacking[i + 3] = (byte)alpha;
-                }
-            }
+            _dibBitsBacking[i] = (byte)pmB;
+            _dibBitsBacking[i + 1] = (byte)pmG;
+            _dibBitsBacking[i + 2] = (byte)pmR;
+            _dibBitsBacking[i + 3] = (byte)finalA;
         }
 
         // Write the processed pixels BACK to the DIB so UpdateLayeredWindow sees them.
@@ -2380,6 +2369,9 @@ internal static class Program
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint GetDpiForWindow(IntPtr hwnd);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
 
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern int RegOpenKeyEx(IntPtr hKey, string lpSubKey, uint ulOptions, int samDesired, out IntPtr phkResult);
